@@ -190,7 +190,7 @@ jobs:
           cd "$SCRAPER_DIR"
           python3 -m venv .venv
           source .venv/bin/activate
-          pip install --no-cache-dir undetected-chromedriver requests setuptools
+          pip install --no-cache-dir undetected-chromedriver requests setuptools flask
           nohup python3 url_scraper.py --workers 1 > /tmp/url-scraper.log 2>&1 &
           SCRAPER_PID=$!
           echo "  Scraper PID: $SCRAPER_PID"
