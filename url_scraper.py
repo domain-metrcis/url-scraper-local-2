@@ -407,8 +407,10 @@ def create_app(pool: BrowserPool):
         # Add raw page_source as page_html in scraped_data (for AI selector detection)
         page_source = result.get("page_source", "")
         if page_source:
-            scraped_data.insert(0, {"name": "page_html", "selector": "html", "value": page_source})
-            variables["page_html"] = page_source
+            # Truncate to 100K to keep response fast over the tunnel
+            truncated_source = page_source[:100000] if len(page_source) > 100000 else page_source
+            scraped_data.insert(0, {"name": "page_html", "selector": "html", "value": truncated_source})
+            variables["page_html"] = truncated_source
 
         if result.get("page_info"):
             raw = result["page_info"]
