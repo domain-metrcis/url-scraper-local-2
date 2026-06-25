@@ -252,6 +252,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         result["scraped_data"] = scraped_data_raw
         result["page_info"] = page_info_raw
         result["final_url"] = driver.current_url
+        result["page_source"] = driver.page_source
         result["status"] = "completed"
 
     except Exception as e:
@@ -402,6 +403,12 @@ def create_app(pool: BrowserPool):
                 for item in parsed:
                     if isinstance(item, dict) and item.get("name"):
                         variables[item["name"]] = item.get("value")
+
+        # Add raw page_source as page_html in scraped_data (for AI selector detection)
+        page_source = result.get("page_source", "")
+        if page_source:
+            scraped_data.append({"name": "page_html", "selector": "html", "value": page_source})
+            variables["page_html"] = page_source
 
         if result.get("page_info"):
             raw = result["page_info"]
