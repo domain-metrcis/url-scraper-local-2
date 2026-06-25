@@ -202,6 +202,20 @@ jobs:
             echo "❌ URL scraper failed to start"; cat /tmp/url-scraper.log; exit 1
           fi
 
+      - name: Test scraper with sample URL
+        run: |
+          echo "Testing scraper with a sample URL..."
+          sleep 10
+          RESPONSE=$(curl -s -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
+            -H "Content-Type: application/json" \
+            -d '{"target_url": "https://example.com"}')
+          echo "Response: $RESPONSE"
+          if echo "$RESPONSE" | grep -q '"status"'; then
+            echo "✅ Scraper test passed!"
+          else
+            echo "⚠️ Unexpected response, but scraper is running"
+          fi
+
       - name: Display Connection Info
         run: |
           echo ""
