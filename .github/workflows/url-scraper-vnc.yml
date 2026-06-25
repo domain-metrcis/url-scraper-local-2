@@ -17,11 +17,15 @@ jobs:
 
     steps:
       - name: Clone url-scraper-local code
+        uses: actions/checkout@v4
+        with:
+          path: url-scraper-local
+
+      - name: Move code to expected directory
         run: |
-          echo "Cloning url-scraper-local repository..."
           rm -rf "$SCRAPER_DIR"
-          git clone --depth 1 https://github.com/ai-botxbyte/url-scraper-local.git "$SCRAPER_DIR"
-          echo "✅ url-scraper-local cloned to $SCRAPER_DIR"
+          mv url-scraper-local "$SCRAPER_DIR"
+          echo "✅ url-scraper-local ready at $SCRAPER_DIR"
           ls -la "$SCRAPER_DIR"
 
       - name: Set up Python
