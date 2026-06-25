@@ -176,11 +176,16 @@ jobs:
           cd "$SCRAPER_DIR"
           bash tools/setup_vendor.sh
 
+          # Copy real-botxbyte-extension into vendor
+          cp -r "$SCRAPER_DIR/real-botxbyte-extension" "$SCRAPER_DIR/vendor/real-botxbyte-extension"
+
           test -x vendor/ungoogled-chromium/chrome \
             || { echo "❌ vendor/ungoogled-chromium/chrome missing"; exit 1; }
           test -f vendor/cf-autoclick/manifest.json \
             || { echo "❌ vendor/cf-autoclick/manifest.json missing"; exit 1; }
-          echo "✅ Vendor setup complete"
+          test -f vendor/real-botxbyte-extension/manifest.json \
+            || { echo "❌ vendor/real-botxbyte-extension/manifest.json missing"; exit 1; }
+          echo "✅ Vendor setup complete (with real-botxbyte-extension)"
 
       - name: Start URL Scraper
         run: |
