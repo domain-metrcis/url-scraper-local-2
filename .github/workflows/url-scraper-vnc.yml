@@ -169,6 +169,26 @@ jobs:
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "✅ Cloudflare tunnel ready: $TUNNEL_URL"
 
+      - name: Start Cloudflare Tunnel for Scraper API
+        id: scraper_tunnel
+        run: |
+          echo "Starting Cloudflare quick tunnel for scraper API (port 8814)..."
+          cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/scraper-tunnel.log 2>&1 &
+
+          SCRAPER_TUNNEL_URL=""
+          for i in $(seq 1 30); do
+            SCRAPER_TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/scraper-tunnel.log | head -1)
+            if [ -n "$SCRAPER_TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+
+          if [ -z "$SCRAPER_TUNNEL_URL" ]; then
+            echo "❌ Failed to obtain scraper tunnel URL"; cat /tmp/scraper-tunnel.log; exit 1
+          fi
+
+          echo "scraper_tunnel_url=$SCRAPER_TUNNEL_URL" >> $GITHUB_OUTPUT
+          echo "✅ Scraper tunnel ready: $SCRAPER_TUNNEL_URL"
+
       - name: Setup vendored chromium + cf-autoclick extension
         timeout-minutes: 5
         run: |
@@ -221,6 +241,40 @@ jobs:
             echo "⚠️ Unexpected response, but scraper is running"
           fi
 
+      - name: Update Backend with Scraper Tunnel URL
+        env:
+          SCRAPER_TUNNEL_URL: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}
+        run: |
+          echo "Updating cloudflare_tunnel_url in backend..."
+          TOKEN=$(curl -s "https://backend.articleinnovator.com/user-management-service/api/v1/auth/login/" \
+            -H "Content-Type: application/json" \
+            -d '{"email":"jaydeep@botxbyte.com","password":"Jaydeep@1234"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['access_token'])")
+
+          # Find the system variable ID
+          VAR_DATA=$(curl -s "https://backend.articleinnovator.com/configuration-service/api/v1/system-variables/?search=cloudflare_tunnel_url&limit=10" \
+            -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010")
+          VAR_ID=$(echo "$VAR_DATA" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for item in data.get('data', []):
+              if item.get('key') == 'cloudflare_tunnel_url':
+                  print(item['system_variable_id'])
+                  break
+          " 2>/dev/null)
+
+          if [ -n "$VAR_ID" ]; then
+            curl -s -X PATCH "https://backend.articleinnovator.com/configuration-service/api/v1/system-variable/update/$VAR_ID/" \
+              -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010" \
+              -H "Content-Type: application/json" \
+              -d "{\"value\":\"$SCRAPER_TUNNEL_URL\"}" | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅ Updated:', d.get('data',{}).get('value',''))"
+          else
+            curl -s -X POST "https://backend.articleinnovator.com/configuration-service/api/v1/system-variable/create/" \
+              -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"Cloudflare Tunnel URL\",\"key\":\"cloudflare_tunnel_url\",\"value\":\"$SCRAPER_TUNNEL_URL\",\"description\":\"Cloudflare tunnel URL for push-based scraping\",\"is_readonly\":false}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅ Created:', d.get('data',{}).get('value',''))"
+          fi
+
       - name: Display Connection Info
         run: |
           echo ""
@@ -231,7 +285,10 @@ jobs:
           echo "🌐 VNC Access URL: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
           echo "🔑 Password: botxbyte123"
           echo ""
-          echo "🐍 url_scraper.py running with: --workers 1 (pull-based)"
+          echo "🚀 Scraper API Tunnel: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
+          echo "   POST ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}/url-scraper-service/api/v1/scrape/"
+          echo ""
+          echo "🐍 url_scraper.py running with: --workers 1 (push-based via tunnel)"
           echo ""
 
       - name: Keep Session Alive
@@ -242,6 +299,7 @@ jobs:
 
           while true; do
             echo "🌐 VNC: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html | Password: botxbyte123"
+            echo "🚀 Scraper: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
 
             # Restart VNC if it died
             if ! pgrep -f "Xvnc.*:1" > /dev/null; then
@@ -250,10 +308,14 @@ jobs:
               sleep 3
             fi
 
-            # Restart tunnel if it died
-            if ! pgrep -x "cloudflared" > /dev/null; then
-              echo "❌ Tunnel stopped! Restarting..."
+            # Restart tunnels if they died
+            TUNNEL_COUNT=$(pgrep -cx "cloudflared")
+            if [ "$TUNNEL_COUNT" -lt 2 ]; then
+              echo "❌ Tunnel(s) stopped! Restarting..."
+              pkill -x cloudflared || true
+              sleep 2
               cloudflared tunnel --no-autoupdate --url http://localhost:$NOVNC_PORT > /tmp/tunnel.log 2>&1 &
+              cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/scraper-tunnel.log 2>&1 &
               sleep 5
             fi
 
