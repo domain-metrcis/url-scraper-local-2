@@ -1,0 +1,60 @@
+{
+  "url": "https://venice.ai/sign-in#/?sign_up_force_redirect_url=https%3A%2F%2Fvenice.ai%2Fsign-up-migration&sign_in_force_redirect_url=https%3A%2F%2Fvenice.ai%2Fchat&redirect_url=https%3A%2F%2Fvenice.ai%2Fchat",
+  "variables": {
+    "query_id": ""
+  },
+  "options": {
+    "new_tab": true,
+    "close_tab": true,
+    "close_tab_on_error": true
+  },
+  "actions": [
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "document.body.click(); return 'clicked_body';",
+      "set_variable": "_body_click"
+    },
+    {
+      "type": "delay",
+      "timeout": 1000
+    },
+    {
+      "type": "evaluate",
+      "script": "var googleBtn = document.querySelector('div.chakra-button[aria-label=\"Google\"]') || document.querySelector('button:has(div[aria-label=\"Google\"])') || document.querySelector('button:has(img[alt=\"Google logo\"])'); if (googleBtn) { if (googleBtn.tagName.toLowerCase() === 'button') { googleBtn.click(); } else { var parentBtn = googleBtn.closest('button'); if (parentBtn) { parentBtn.click(); } else { googleBtn.click(); } } return 'google_clicked'; } return 'google_not_found';",
+      "set_variable": "google_click"
+    },
+    {
+      "type": "evaluate",
+      "script": "if ('${google_click}' === 'google_clicked') { await new Promise(r => setTimeout(r, 5000)); var account = document.querySelector('div[data-identifier][role=\"link\"]') || document.querySelector('div[data-identifier]') || document.querySelector('.VV3oRb[role=\"link\"]') || document.querySelector('div[data-email]'); if (account) { account.click(); return 'account_clicked'; } return 'account_not_found'; } return 'google_not_clicked';",
+      "set_variable": "account_click"
+    },
+    {
+      "type": "evaluate",
+      "script": "if ('${account_click}' === 'account_clicked') { await new Promise(r => setTimeout(r, 10000)); return 'login_complete'; } else if ('${account_click}' === 'account_not_found') { await new Promise(r => setTimeout(r, 5000)); var account = document.querySelector('div[data-identifier][role=\"link\"]') || document.querySelector('div[data-identifier]') || document.querySelector('.VV3oRb[role=\"link\"]') || document.querySelector('div[data-email]'); if (account) { account.click(); await new Promise(r => setTimeout(r, 10000)); return 'account_clicked_retry'; } return 'account_not_found_retry'; } return 'skipped';",
+      "set_variable": "account_click_retry"
+    },
+    {
+      "type": "delay",
+      "timeout": 5000
+    },
+    {
+      "type": "evaluate",
+      "script": "return '${google_click}' === 'google_clicked' ? 'logged_in' : 'not_logged_in';",
+      "set_variable": "success"
+    }
+  ],
+  "webhook": "",
+  "webhook_payload": {
+    "query_id": "${query_id}",
+    "google_click": "${google_click}",
+    "account_click": "${account_click}",
+    "account_click_retry": "${account_click_retry}",
+    "login_status": "${success}",
+    "error_message": "${error_message}",
+    "service_type": "venice-login"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "url": "https://chatgpt.com",
+  "variables": {
+    "message": "",
+    "query_id": ""
+  },
+  "options": {
+    "new_tab": true,
+    "close_tab": true,
+    "close_tab_on_error": true,
+    "imagekit_public_key": "public_EelsVrk0nhNJx3t03EzepNSUhS4=",
+    "is_image_generation": true,
+    "imagekit_private_key": "private_H1amoDNFmc0sTfYPdo81OhMxizo=",
+    "imagekit_url_endpoint": "https://ik.imagekit.io/mslbqkhsp"
+  },
+  "actions": [
+    {
+      "type": "delay",
+      "timeout": 2000
+    },
+    {
+      "type": "wait_for",
+      "selectors": ["#prompt-textarea"],
+      "timeout": 15000
+    },
+    {
+      "type": "evaluate",
+      "script": "var el = document.querySelector('#prompt-textarea'); if (!el) throw new Error('textarea not found'); el.focus(); await new Promise(r => setTimeout(r, 300)); var sel = window.getSelection(); var range = document.createRange(); range.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(range); document.execCommand('delete', false, null); await new Promise(r => setTimeout(r, 200)); document.execCommand('insertText', false, '${message}'); await new Promise(r => setTimeout(r, 1000)); var btn = document.querySelector('#composer-submit-button') || document.querySelector('button[data-testid=\"send-button\"]') || document.querySelector('button[aria-label=\"Send prompt\"]'); if (!btn) throw new Error('send button not found'); btn.click(); return 'message_sent';",
+      "set_variable": "send_status"
+    },
+    {
+      "type": "evaluate",
+      "script": "await new Promise(r => setTimeout(r, 5000)); var prev = ''; var stable = 0; for (var i = 0; i < 60; i++) { await new Promise(r => setTimeout(r, 2000)); var genImg = document.querySelector('img[alt^=\"Generated image\"]'); if (genImg && genImg.complete && genImg.naturalWidth > 0) { await new Promise(r => setTimeout(r, 30000)); var els = document.querySelectorAll('div[data-message-author-role=\"assistant\"]'); var txt = els.length > 0 ? (els[els.length - 1].innerText || '') : ''; return txt; } var els = document.querySelectorAll('div[data-message-author-role=\"assistant\"]'); if (els.length > 0) { var txt = els[els.length - 1].innerText || ''; if (txt.length > 0 && txt === prev) { stable++; if (stable >= 2) { return txt; } } else { stable = 0; prev = txt; } } } return prev || '';",
+      "set_variable": "chatgpt_response"
+    },
+    {
+      "type": "evaluate",
+      "script": "await new Promise(r => setTimeout(r, 1000)); var imgs = document.querySelectorAll('img[alt^=\"Generated image\"]'); for (var j = imgs.length - 1; j >= 0; j--) { var img = imgs[j]; if (img && img.src && img.src.startsWith('http') && img.complete && img.naturalWidth > 0) { return img.src; } } return '';",
+      "set_variable": "generated_image_src"
+    },
+    {
+      "type": "download_and_upload",
+      "set_variable": "generated_image_file_path"
+    },
+    {
+      "type": "set_variable",
+      "name": "success",
+      "value": "true"
+    }
+  ],
+  "webhook": "",
+  "webhook_payload": {
+    "query_id": "${query_id}",
+    "success": "${success}",
+    "message": "${message}",
+    "response": "${chatgpt_response}",
+    "generated_image_url": "${generated_image_url}",
+    "generated_image_src": "${generated_image_src}",
+    "error_message": "${error_message}",
+    "service_type": "chatgpt"
+  }
+}

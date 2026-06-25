@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "BotXByte Workflow Runner",
+  "version": "1.1.0",
+  "description": "Execute automated workflows with Turnstile solving and geo spoofing",
+  "permissions": ["activeTab", "scripting", "storage", "tabs", "alarms", "declarativeNetRequest", "declarativeNetRequestWithHostAccess", "webNavigation", "debugger", "downloads", "cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["csp_stripper.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["turnstile_injected.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["turnstile_bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "strip_csp",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  }
+}

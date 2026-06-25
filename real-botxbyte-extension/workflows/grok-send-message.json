@@ -1,0 +1,52 @@
+{
+  "url": "https://grok.com",
+  "variables": {
+    "message": "tell me about pm modi",
+    "query_id": ""
+  },
+  "options": {
+    "new_tab": true,
+    "close_tab": true,
+    "close_tab_on_error": true
+  },
+  "actions": [
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "wait_for",
+      "selectors": [
+        "div[contenteditable=\"true\"][translate=\"no\"].tiptap.ProseMirror",
+        "div.tiptap.ProseMirror[contenteditable=\"true\"]",
+        "div[contenteditable=\"true\"].tiptap",
+        "div.ProseMirror[contenteditable=\"true\"]"
+      ],
+      "timeout": 15000
+    },
+    {
+      "type": "evaluate",
+      "script": "var el = document.querySelector('div[contenteditable=\"true\"][translate=\"no\"].tiptap.ProseMirror') || document.querySelector('div.tiptap.ProseMirror[contenteditable=\"true\"]') || document.querySelector('div[contenteditable=\"true\"].tiptap') || document.querySelector('div.ProseMirror[contenteditable=\"true\"]'); if (!el) throw new Error('prompt input not found'); el.innerHTML = ''; var p = document.createElement('p'); p.textContent = '${message}'; el.appendChild(p); el.focus(); await new Promise(r => setTimeout(r, 1000)); var btn = document.querySelector('button[type=\"submit\"][aria-label=\"Submit\"]') || document.querySelector('button[aria-label=\"Submit\"]') || document.querySelector('button[type=\"submit\"].group.rounded-full'); if (!btn) throw new Error('send button not found'); btn.click(); return 'message_sent';",
+      "set_variable": "send_status"
+    },
+    {
+      "type": "evaluate",
+      "script": "await new Promise(r => setTimeout(r, 5000)); var prev = ''; var stable = 0; for (var i = 0; i < 60; i++) { await new Promise(r => setTimeout(r, 2000)); var els = document.querySelectorAll('div.response-content-markdown.markdown'); if (els.length === 0) { els = document.querySelectorAll('div.response-content-markdown p'); } if (els.length === 0) { els = document.querySelectorAll('p.break-words[dir=\"auto\"]'); } if (els.length > 0) { var txt = els[els.length - 1].innerText || ''; if (txt.length > 0 && txt === prev) { stable++; if (stable >= 2) { return txt; } } else { stable = 0; prev = txt; } } } return prev || '';",
+      "set_variable": "grok_response"
+    },
+    {
+      "type": "set_variable",
+      "name": "success",
+      "value": "true"
+    }
+  ],
+  "webhook": "",
+  "webhook_payload": {
+    "query_id": "${query_id}",
+    "success": "${success}",
+    "message": "${message}",
+    "response": "${grok_response}",
+    "error_message": "${error_message}",
+    "service_type": "grok"
+  }
+}

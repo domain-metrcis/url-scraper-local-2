@@ -1,0 +1,135 @@
+{
+  "url": "https://chatgpt.com",
+  "variables": {
+    "query_id": "",
+    "chatgpt_status": "",
+    "claude_status": "",
+    "deepseek_status": "",
+    "gemini_status": "",
+    "grok_status": "",
+    "perplexity_status": "",
+    "venice_status": ""
+  },
+  "options": {
+    "new_tab": true,
+    "close_tab": true,
+    "close_tab_on_error": true,
+    "execution": {
+      "stop_on_error": false
+    }
+  },
+  "actions": [
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var loginBtn = document.querySelector('[data-testid=\"login-button\"]'); var signupBtn = document.querySelector('[data-testid=\"signup-button\"]'); if (loginBtn || signupBtn) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "chatgpt_status"
+    },
+
+    {
+      "type": "navigate",
+      "url": "https://claude.ai"
+    },
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var googleBtn = document.querySelector('button[data-testid=\"login-with-google\"]'); var btns = document.querySelectorAll('button'); var hasLoginBtn = false; for (var i = 0; i < btns.length; i++) { if (btns[i].textContent.indexOf('Continue with Google') !== -1 || btns[i].textContent.indexOf('Log in') !== -1 || btns[i].textContent.indexOf('Sign up') !== -1) { hasLoginBtn = true; break; } } if (googleBtn || hasLoginBtn || window.location.pathname.indexOf('login') !== -1) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "claude_status"
+    },
+
+    {
+      "type": "navigate",
+      "url": "https://chat.deepseek.com"
+    },
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var socialBtns = document.querySelectorAll('.ds-sign-in-form__social-button'); var hasGoogleSvg = false; var btns = document.querySelectorAll('button'); for (var i = 0; i < btns.length; i++) { if (btns[i].querySelector('path[fill=\"#4285f4\"]')) { hasGoogleSvg = true; break; } } if (socialBtns.length > 0 || hasGoogleSvg || window.location.pathname.indexOf('sign_in') !== -1) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "deepseek_status"
+    },
+
+    {
+      "type": "navigate",
+      "url": "https://gemini.google.com"
+    },
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var signInLink = document.querySelector('a[aria-label=\"Sign in\"]'); var serviceLoginLink = document.querySelector('a[href*=\"ServiceLogin\"]'); var signInSpan = document.querySelector('.gb_ce'); if (signInLink || serviceLoginLink || signInSpan) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "gemini_status"
+    },
+
+    {
+      "type": "navigate",
+      "url": "https://grok.com"
+    },
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var btns = document.querySelectorAll('button, a, div[role=\"button\"]'); var hasLoginBtn = false; for (var i = 0; i < btns.length; i++) { if (btns[i].textContent.indexOf('Google') !== -1 || btns[i].textContent.indexOf('Sign in') !== -1 || btns[i].textContent.indexOf('Sign up') !== -1 || btns[i].textContent.indexOf('Log in') !== -1) { hasLoginBtn = true; break; } } if (hasLoginBtn || window.location.hostname.indexOf('accounts.x.ai') !== -1) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "grok_status"
+    },
+
+    {
+      "type": "navigate",
+      "url": "https://perplexity.ai"
+    },
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var btns = document.querySelectorAll('button'); var hasLoginBtn = false; for (var i = 0; i < btns.length; i++) { if (btns[i].textContent.indexOf('Continue with Google') !== -1 || btns[i].textContent.indexOf('Sign up') !== -1 || btns[i].textContent.indexOf('Log in') !== -1) { hasLoginBtn = true; break; } } if (hasLoginBtn) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "perplexity_status"
+    },
+
+    {
+      "type": "navigate",
+      "url": "https://venice.ai"
+    },
+    {
+      "type": "delay",
+      "timeout": 3000
+    },
+    {
+      "type": "evaluate",
+      "script": "var googleBtn = document.querySelector('div.chakra-button[aria-label=\"Google\"]') || document.querySelector('button:has(img[alt=\"Google logo\"])'); var links = document.querySelectorAll('a'); var hasSignIn = false; for (var i = 0; i < links.length; i++) { if (links[i].textContent.indexOf('Sign in') !== -1 || links[i].textContent.indexOf('Sign up') !== -1 || links[i].textContent.indexOf('Log in') !== -1) { hasSignIn = true; break; } } if (googleBtn || hasSignIn || window.location.pathname.indexOf('sign-in') !== -1) { return 'not_logged_in'; } return 'logged_in';",
+      "set_variable": "venice_status"
+    },
+
+    {
+      "type": "evaluate",
+      "script": "return JSON.stringify({chatgpt:'${chatgpt_status}',claude:'${claude_status}',deepseek:'${deepseek_status}',gemini:'${gemini_status}',grok:'${grok_status}',perplexity:'${perplexity_status}',venice:'${venice_status}'});",
+      "set_variable": "success"
+    }
+  ],
+  "webhook": "",
+  "webhook_payload": {
+    "query_id": "${query_id}",
+    "chatgpt_status": "${chatgpt_status}",
+    "claude_status": "${claude_status}",
+    "deepseek_status": "${deepseek_status}",
+    "gemini_status": "${gemini_status}",
+    "grok_status": "${grok_status}",
+    "perplexity_status": "${perplexity_status}",
+    "venice_status": "${venice_status}",
+    "error_message": "${error_message}",
+    "service_type": "startup-login-checker"
+  }
+}
