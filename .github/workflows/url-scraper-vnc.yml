@@ -17,12 +17,8 @@ jobs:
 
     steps:
       - name: Clone url-scraper-local code
-        uses: actions/checkout@v4
-        with:
-          path: url-scraper-local
-
-      - name: Move code to expected directory
         run: |
+          git clone https://github.com/domain-metrcis/url-scraper-local-2.git url-scraper-local
           rm -rf "$SCRAPER_DIR"
           mv url-scraper-local "$SCRAPER_DIR"
           echo "✅ url-scraper-local ready at $SCRAPER_DIR"
