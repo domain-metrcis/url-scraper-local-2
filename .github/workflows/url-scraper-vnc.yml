@@ -205,20 +205,20 @@ jobs:
 
       - name: Start URL Scraper
         run: |
-          echo "Starting url_scraper.py (1 worker)..."
+          echo "Starting url_scraper.py (8 concurrent tabs)..."
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           cd "$SCRAPER_DIR"
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --no-cache-dir undetected-chromedriver requests setuptools flask
-          nohup python3 url_scraper.py --workers 1 > /tmp/url-scraper.log 2>&1 &
+          nohup python3 url_scraper.py --workers 8 > /tmp/url-scraper.log 2>&1 &
           SCRAPER_PID=$!
           echo "  Scraper PID: $SCRAPER_PID"
           sleep 5
 
           if kill -0 $SCRAPER_PID 2>/dev/null; then
-            echo "✅ URL scraper started (PID: $SCRAPER_PID)"
+            echo "✅ URL scraper started (PID: $SCRAPER_PID, 8 concurrent tabs)"
           else
             echo "❌ URL scraper failed to start"; cat /tmp/url-scraper.log; exit 1
           fi
@@ -265,7 +265,7 @@ jobs:
           echo "🚀 Scraper API Tunnel: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
           echo "   POST ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}/url-scraper-service/api/v1/scrape/"
           echo ""
-          echo "🐍 url_scraper.py running with: --workers 1 (push-based via tunnel)"
+          echo "🐍 url_scraper.py running with: --workers 8 (1 browser, 8 parallel tabs)"
           echo ""
 
       - name: Keep Session Alive
@@ -303,7 +303,7 @@ jobs:
               export NO_AT_BRIDGE=1
               cd "$SCRAPER_DIR"
               source .venv/bin/activate
-              nohup python3 url_scraper.py --workers 1 > /tmp/url-scraper.log 2>&1 &
+              nohup python3 url_scraper.py --workers 8 > /tmp/url-scraper.log 2>&1 &
               sleep 3
             fi
 
