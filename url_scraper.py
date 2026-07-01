@@ -269,12 +269,14 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 class BrowserPool:
-    """Thread-safe pool of browser instances."""
+    """Single-browser, multi-tab pool. One browser stays open with a permanent
+    blank tab; scrape requests open new tabs in parallel (up to `size` concurrent).
+    Much faster than multiple browser instances and avoids timeout issues."""
 
     def __init__(self, size: int, headless: bool, chrome_bin: Optional[str],
                  version_main: Optional[int], extension_path: Optional[str],
                  cf_autoclick_path: Optional[str]):
-        self._size = size
+        self._max_tabs = size
         self._headless = headless
         self._chrome_bin = chrome_bin
         self._version_main = version_main
@@ -282,58 +284,112 @@ class BrowserPool:
         self._cf_autoclick_path = cf_autoclick_path
         self._semaphore = threading.Semaphore(size)
         self._lock = threading.Lock()
-        self._drivers: List[tuple] = []  # [(driver, profile, uses)]
-        self._next_id = 0
+        self._driver = None
+        self._profile = None
+        self._total_scrapes = 0
+        self._recycle_after = 200  # Restart browser after N scrapes (memory leaks)
+        self._home_handle = None  # Permanent blank tab
+        self._initializing = False
+        self._init_lock = threading.Lock()
 
-    def _create(self) -> tuple:
-        wid = self._next_id
-        self._next_id += 1
-        driver, profile = build_driver(
-            wid, self._headless, self._chrome_bin, self._version_main,
-            self._extension_path, self._cf_autoclick_path,
-        )
-        return driver, profile, 0
+    def _ensure_browser(self):
+        """Ensure browser is running. Creates one if not."""
+        with self._init_lock:
+            if self._driver is not None:
+                # Verify browser is still alive
+                try:
+                    _ = self._driver.current_url
+                    return
+                except Exception:
+                    # Browser died, recreate
+                    self._safe_quit()
 
-    def acquire(self) -> tuple:
-        self._semaphore.acquire()
-        with self._lock:
-            if self._drivers:
-                return self._drivers.pop()
-        return self._create()
+            print("[TabPool] Starting browser...")
+            self._driver, self._profile = build_driver(
+                0, self._headless, self._chrome_bin, self._version_main,
+                self._extension_path, self._cf_autoclick_path,
+            )
+            # Navigate to blank page — this is the permanent "home" tab
+            self._driver.get("about:blank")
+            self._home_handle = self._driver.current_window_handle
+            self._total_scrapes = 0
+            print(f"[TabPool] Browser ready (max {self._max_tabs} concurrent tabs)")
 
-    def release(self, entry: tuple, broken: bool = False):
-        driver, profile, uses = entry
-        uses += 1
-        if broken or uses >= 50:
+    def _safe_quit(self):
+        """Safely quit existing browser."""
+        if self._driver:
             try:
-                driver.quit()
+                self._driver.quit()
             except Exception:
                 pass
-            _remove_profile(profile)
-        else:
-            try:
-                driver.get("about:blank")
-            except Exception:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                _remove_profile(profile)
-                self._semaphore.release()
-                return
+            self._driver = None
+        if self._profile:
+            _remove_profile(self._profile)
+            self._profile = None
+        self._home_handle = None
+
+    def _should_recycle(self) -> bool:
+        return self._total_scrapes >= self._recycle_after
+
+    def acquire_tab(self) -> str:
+        """Open a new tab and return its window handle. Blocks if at max concurrency."""
+        self._semaphore.acquire()
+        try:
+            self._ensure_browser()
+
+            # Check if we should recycle browser (do it when no other tabs are active)
+            if self._should_recycle():
+                with self._lock:
+                    handles = self._driver.window_handles
+                    # Only recycle if just the home tab is open (no active scrapes)
+                    if len(handles) <= 1:
+                        print(f"[TabPool] Recycling browser after {self._total_scrapes} scrapes")
+                        self._safe_quit()
+                        self._ensure_browser()
+
+            # Open new tab
             with self._lock:
-                self._drivers.append((driver, profile, uses))
-        self._semaphore.release()
+                self._driver.switch_to.new_window("tab")
+                new_handle = self._driver.current_window_handle
+                self._total_scrapes += 1
+            return new_handle
+        except Exception as e:
+            self._semaphore.release()
+            raise RuntimeError(f"Failed to open tab: {e}")
+
+    def get_driver(self):
+        """Get the shared driver instance."""
+        return self._driver
+
+    def release_tab(self, handle: str, broken: bool = False):
+        """Close the tab and release the semaphore slot."""
+        try:
+            if self._driver and handle != self._home_handle:
+                with self._lock:
+                    try:
+                        self._driver.switch_to.window(handle)
+                        self._driver.close()
+                    except Exception:
+                        pass
+                    # Switch back to home tab
+                    try:
+                        if self._home_handle in self._driver.window_handles:
+                            self._driver.switch_to.window(self._home_handle)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            self._semaphore.release()
+
+        # If browser is broken, force restart on next acquire
+        if broken:
+            with self._init_lock:
+                self._safe_quit()
 
     def shutdown(self):
-        with self._lock:
-            for driver, profile, _ in self._drivers:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                _remove_profile(profile)
-            self._drivers.clear()
+        self._safe_quit()
+        _cleanup_all()
 
 
 # --------------------------------------------------------------------------- #
@@ -381,16 +437,19 @@ def create_app(pool: BrowserPool):
             for s in selectors
         ])
 
-        entry = pool.acquire()
-        driver, profile, uses = entry
+        entry = pool.acquire_tab()
+        handle = entry
+        driver = pool.get_driver()
         broken = False
         try:
+            # Switch to our tab
+            driver.switch_to.window(handle)
             result = scrape_url(driver, target_url, selectors_json)
         except Exception as e:
             broken = True
             result = {"target_url": target_url, "status": "error", "error": str(e)}
         finally:
-            pool.release((driver, profile, uses), broken=broken)
+            pool.release_tab(handle, broken=broken)
 
         # Parse scraped_data into variables
         variables = {}
@@ -462,7 +521,7 @@ def main():
     p.add_argument("--port", type=int, default=8814)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--headless", action="store_true")
-    p.add_argument("--workers", type=int, default=3, help="Browser pool size")
+    p.add_argument("--workers", type=int, default=5, help="Max concurrent tabs (parallel scrapes)")
     p.add_argument("--chrome", help="Path to chrome/chromium binary")
     p.add_argument("--extension", help="Path to real-botxbyte-extension folder")
     args = p.parse_args()
@@ -494,14 +553,15 @@ def main():
     chrome_bin = args.chrome or find_chrome_binary()
     version_main = detect_chrome_major(chrome_bin)
 
-    print(f"[*] URL Scraper - Push-based Local Worker (HTTP Server)")
+    print(f"[*] URL Scraper - Multi-Tab Parallel Worker (HTTP Server)")
     print(f"[*] Listening: http://{args.host}:{args.port}")
     print(f"[*] Endpoint: POST /url-scraper-service/api/v1/scrape/")
     print(f"[*] Chrome: {chrome_bin}")
     print(f"[*] CF-Autoclick: {cf_autoclick_path or 'none'}")
     print(f"[*] Extension: {extension_path or 'none'}")
-    print(f"[*] Pool size: {args.workers}")
+    print(f"[*] Max concurrent tabs: {args.workers}")
     print(f"[*] Workflow: {WORKFLOW_JSON_PATH}")
+    print(f"[*] Architecture: 1 browser, {args.workers} parallel tabs")
     print()
 
     pool = BrowserPool(
