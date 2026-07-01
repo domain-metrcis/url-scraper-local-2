@@ -308,82 +308,152 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 class BrowserPool:
-    """Thread-safe pool of browser instances. Each scrape request gets its own
-    dedicated browser instance — no tab sharing (Selenium is not thread-safe
-    for multi-tab on a single driver).
+    """Single browser, multi-tab with per-tab locking.
     
-    Pool pre-warms browsers and recycles them after N uses to prevent memory leaks."""
+    1 Chrome instance with 8 pre-opened tabs. Each tab has its own lock.
+    A request acquires a free tab (lock), navigates to the URL, extracts
+    data, then navigates to about:blank and releases the lock.
+    
+    This avoids thread-safety issues because each tab is exclusively owned
+    by one thread at a time (via its dedicated lock)."""
 
     def __init__(self, size: int, headless: bool, chrome_bin: Optional[str],
                  version_main: Optional[int], extension_path: Optional[str],
                  cf_autoclick_path: Optional[str]):
-        self._max_size = size
+        self._max_tabs = size
         self._headless = headless
         self._chrome_bin = chrome_bin
         self._version_main = version_main
         self._extension_path = extension_path
         self._cf_autoclick_path = cf_autoclick_path
+        self._driver = None
+        self._profile = None
+        self._init_lock = threading.Lock()
+        # Each tab: {"handle": str, "lock": threading.Lock()}
+        self._tabs: List[Dict[str, Any]] = []
+        # Semaphore to limit concurrent tab usage
         self._semaphore = threading.Semaphore(size)
-        self._lock = threading.Lock()
-        self._drivers: List[tuple] = []  # [(driver, profile, uses)]
-        self._next_id = 0
-        self._recycle_after = 30  # Restart browser after N scrapes
+        # Queue of available tab indices
+        self._available: List[int] = []
+        self._queue_lock = threading.Lock()
+        self._total_scrapes = 0
+        self._recycle_after = 200
 
-    def _create(self) -> tuple:
-        wid = self._next_id
-        self._next_id += 1
-        driver, profile = build_driver(
-            wid, self._headless, self._chrome_bin, self._version_main,
-            self._extension_path, self._cf_autoclick_path,
-        )
-        return driver, profile, 0
+    def _ensure_browser(self):
+        """Start browser and pre-open tabs."""
+        with self._init_lock:
+            if self._driver is not None:
+                try:
+                    _ = self._driver.title
+                    return
+                except Exception:
+                    self._force_restart()
 
-    def acquire(self) -> tuple:
-        self._semaphore.acquire()
-        with self._lock:
-            if self._drivers:
-                return self._drivers.pop()
-        try:
-            return self._create()
-        except Exception as e:
-            self._semaphore.release()
-            raise RuntimeError(f"Failed to create browser: {e}")
+            print(f"[BrowserPool] Starting browser with {self._max_tabs} tabs...")
+            self._driver, self._profile = build_driver(
+                0, self._headless, self._chrome_bin, self._version_main,
+                self._extension_path, self._cf_autoclick_path,
+            )
+            
+            # First tab already exists (the initial tab)
+            self._tabs = []
+            first_handle = self._driver.current_window_handle
+            self._tabs.append({"handle": first_handle, "lock": threading.Lock()})
+            
+            # Open remaining tabs
+            for i in range(1, self._max_tabs):
+                self._driver.execute_script("window.open('about:blank');")
+                time.sleep(0.3)
+            
+            # Collect all handles
+            all_handles = self._driver.window_handles
+            self._tabs = [{"handle": h, "lock": threading.Lock()} for h in all_handles[:self._max_tabs]]
+            
+            # Navigate all to blank
+            for tab in self._tabs:
+                self._driver.switch_to.window(tab["handle"])
+                self._driver.get("about:blank")
+            
+            # Mark all as available
+            self._available = list(range(len(self._tabs)))
+            self._total_scrapes = 0
+            
+            print(f"[BrowserPool] Ready: {len(self._tabs)} tabs pre-opened")
 
-    def release(self, entry: tuple, broken: bool = False):
-        driver, profile, uses = entry
-        uses += 1
-        if broken or uses >= self._recycle_after:
-            # Kill and cleanup
+    def _force_restart(self):
+        """Force restart the browser."""
+        if self._driver:
             try:
-                driver.quit()
+                self._driver.quit()
             except Exception:
                 pass
-            _remove_profile(profile)
-        else:
-            # Navigate to blank to free memory, then return to pool
-            try:
-                driver.get("about:blank")
-            except Exception:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                _remove_profile(profile)
+        self._driver = None
+        if self._profile:
+            _remove_profile(self._profile)
+            self._profile = None
+        self._tabs = []
+        self._available = []
+
+    def acquire(self) -> tuple:
+        """Acquire a free tab. Returns (tab_index, tab_handle).
+        Blocks if all tabs are busy."""
+        self._semaphore.acquire()
+        self._ensure_browser()
+        
+        # Get a free tab index
+        with self._queue_lock:
+            if self._available:
+                idx = self._available.pop(0)
+            else:
+                # This shouldn't happen due to semaphore, but safety fallback
                 self._semaphore.release()
-                return
-            with self._lock:
-                self._drivers.append((driver, profile, uses))
-        self._semaphore.release()
+                raise RuntimeError("No available tabs (semaphore leak)")
+        
+        # Lock this specific tab
+        self._tabs[idx]["lock"].acquire()
+        self._total_scrapes += 1
+        return (idx, self._tabs[idx]["handle"])
+
+    def get_driver(self):
+        return self._driver
+
+    def release(self, entry: tuple, broken: bool = False):
+        """Release the tab back to the pool."""
+        idx, handle = entry
+        try:
+            if not broken and self._driver:
+                try:
+                    # Switch to this tab and navigate to blank (free memory)
+                    self._driver.switch_to.window(handle)
+                    self._driver.get("about:blank")
+                except Exception:
+                    broken = True
+        except Exception:
+            pass
+        finally:
+            # Release tab lock
+            try:
+                self._tabs[idx]["lock"].release()
+            except Exception:
+                pass
+            # Put back in available queue
+            with self._queue_lock:
+                if idx not in self._available:
+                    self._available.append(idx)
+            self._semaphore.release()
+
+        # If broken or too many scrapes, schedule restart
+        if broken or self._total_scrapes >= self._recycle_after:
+            with self._init_lock:
+                if self._total_scrapes >= self._recycle_after:
+                    # Only restart when all tabs are free
+                    with self._queue_lock:
+                        if len(self._available) == len(self._tabs):
+                            print(f"[BrowserPool] Recycling after {self._total_scrapes} scrapes")
+                            self._force_restart()
 
     def shutdown(self):
-        with self._lock:
-            for driver, profile, _ in self._drivers:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                _remove_profile(profile)
-            self._drivers.clear()
+        self._force_restart()
         _cleanup_all()
 
 
@@ -433,15 +503,18 @@ def create_app(pool: BrowserPool):
         ])
 
         entry = pool.acquire()
-        driver, profile, uses = entry
+        idx, handle = entry
+        driver = pool.get_driver()
         broken = False
         try:
+            # Switch to our exclusively-locked tab
+            driver.switch_to.window(handle)
             result = scrape_url(driver, target_url, selectors_json)
         except Exception as e:
             broken = True
             result = {"target_url": target_url, "status": "error", "error": str(e)}
         finally:
-            pool.release((driver, profile, uses), broken=broken)
+            pool.release((idx, handle), broken=broken)
 
         # Parse scraped_data into variables
         variables = {}
@@ -545,15 +618,15 @@ def main():
     chrome_bin = args.chrome or find_chrome_binary()
     version_main = detect_chrome_major(chrome_bin)
 
-    print(f"[*] URL Scraper - Parallel Browser Pool (HTTP Server)")
+    print(f"[*] URL Scraper - Single Browser, Tab-Lock Pool (HTTP Server)")
     print(f"[*] Listening: http://{args.host}:{args.port}")
     print(f"[*] Endpoint: POST /url-scraper-service/api/v1/scrape/")
     print(f"[*] Chrome: {chrome_bin}")
     print(f"[*] CF-Autoclick: {cf_autoclick_path or 'none'}")
     print(f"[*] Extension: {extension_path or 'none'}")
-    print(f"[*] Pool size: {args.workers} browser instances")
+    print(f"[*] Tabs: {args.workers} (each with exclusive lock)")
     print(f"[*] Workflow: {WORKFLOW_JSON_PATH}")
-    print(f"[*] Architecture: {args.workers} isolated browsers, thread-safe")
+    print(f"[*] Architecture: 1 browser, {args.workers} pre-opened tabs, per-tab locking")
     print()
 
     pool = BrowserPool(
