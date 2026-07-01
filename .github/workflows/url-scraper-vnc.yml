@@ -265,7 +265,7 @@ jobs:
           echo "🚀 Scraper API Tunnel: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
           echo "   POST ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}/url-scraper-service/api/v1/scrape/"
           echo ""
-          echo "🐍 url_scraper.py running with: --workers 8 (1 browser, 8 parallel tabs)"
+          echo "🐍 url_scraper.py running with: --workers 8 (8 parallel browser instances)"
           echo ""
 
       - name: Keep Session Alive
