@@ -209,15 +209,49 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {"target_url": target_url, "status": "error"}
 
     try:
+        # Navigate to target URL with retry
+        page_loaded = False
+        for nav_attempt in range(3):
+            try:
+                driver.get(target_url)
+                page_loaded = True
+                break
+            except Exception as nav_err:
+                # Navigation timeout or error — check if page partially loaded
+                try:
+                    current = driver.current_url
+                    if current and current != "about:blank" and "data:" not in current:
+                        page_loaded = True
+                        break
+                except Exception:
+                    pass
+                if nav_attempt < 2:
+                    time.sleep(3)
+
+        if not page_loaded:
+            # Last resort: try once more with shorter timeout
+            try:
+                driver.set_page_load_timeout(15)
+                driver.get(target_url)
+            except Exception:
+                pass
+            finally:
+                driver.set_page_load_timeout(30)
+
+        # Verify we're not still on about:blank
         try:
-            driver.get(target_url)
+            current_url = driver.current_url
+            if current_url == "about:blank" or not current_url:
+                result["error"] = "Navigation failed — page did not load"
+                return result
         except Exception:
             pass
 
-        deadline = time.time() + 30
+        # Wait for body to appear
+        deadline = time.time() + 15
         while time.time() < deadline:
             try:
-                if driver.execute_script("return !!document.querySelector('body')"):
+                if driver.execute_script("return !!document.querySelector('body') && document.readyState !== 'loading'"):
                     break
             except Exception:
                 pass
@@ -228,7 +262,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         # Wait for content to render (dynamic JS pages need more time)
         # Try to detect when main content is loaded
         try:
-            content_deadline = time.time() + 10
+            content_deadline = time.time() + 12
             while time.time() < content_deadline:
                 has_content = driver.execute_script("""
                     var el = document.querySelector('.articlecontent, article, .entry-content, .post-content, [itemprop="articleBody"], main');
