@@ -257,6 +257,28 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
                 pass
             time.sleep(0.5)
 
+        # Detect Cloudflare challenge and wait for it to resolve (cf-autoclick handles it)
+        try:
+            cf_deadline = time.time() + 20
+            while time.time() < cf_deadline:
+                is_cf = driver.execute_script("""
+                    var title = document.title || '';
+                    var body = document.body ? document.body.innerText.substring(0, 500) : '';
+                    var text = (title + ' ' + body).toLowerCase();
+                    var cfSigns = ['just a moment', 'checking your browser', 'attention required',
+                                   'cloudflare', 'verify you are human', 'enable javascript'];
+                    var matches = 0;
+                    for (var i = 0; i < cfSigns.length; i++) {
+                        if (text.indexOf(cfSigns[i]) >= 0) matches++;
+                    }
+                    return matches >= 1;
+                """)
+                if not is_cf:
+                    break
+                time.sleep(2)
+        except Exception:
+            pass
+
         time.sleep(3)
 
         # Wait for content to render (dynamic JS pages need more time)
