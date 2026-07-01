@@ -223,7 +223,24 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
                 pass
             time.sleep(0.5)
 
-        time.sleep(5)
+        time.sleep(3)
+
+        # Wait for content to render (dynamic JS pages need more time)
+        # Try to detect when main content is loaded
+        try:
+            content_deadline = time.time() + 10
+            while time.time() < content_deadline:
+                has_content = driver.execute_script("""
+                    var el = document.querySelector('.articlecontent, article, .entry-content, .post-content, [itemprop="articleBody"], main');
+                    return el && el.innerText && el.innerText.length > 200;
+                """)
+                if has_content:
+                    break
+                time.sleep(1)
+        except Exception:
+            pass
+
+        time.sleep(2)
 
         # Dismiss cookie banners
         try:
@@ -235,7 +252,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        time.sleep(2)
+        time.sleep(1)
         try:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
@@ -245,6 +262,28 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         scraper_js = load_workflow_js(WORKFLOW_JSON_PATH)
         js_with_selectors = scraper_js.replace("${selectors_json}", selectors_json)
         scraped_data_raw = driver.execute_script(f"return (function() {{ {js_with_selectors} }})()")
+
+        # Check if content was extracted — if empty, wait more and retry (page may still be loading)
+        has_content = False
+        if scraped_data_raw:
+            parsed_check = json.loads(scraped_data_raw) if isinstance(scraped_data_raw, str) else scraped_data_raw
+            if isinstance(parsed_check, list):
+                for item in parsed_check:
+                    if isinstance(item, dict) and item.get("name") == "source_content":
+                        val = item.get("value", "")
+                        if val and len(str(val)) > 200:
+                            has_content = True
+                            break
+
+        if not has_content:
+            # Retry after additional wait — page JS may still be rendering
+            time.sleep(5)
+            try:
+                driver.execute_script("window.scrollTo(0, 0)")
+            except Exception:
+                pass
+            time.sleep(2)
+            scraped_data_raw = driver.execute_script(f"return (function() {{ {js_with_selectors} }})()")
 
         page_info_js = load_page_info_js(WORKFLOW_JSON_PATH)
         page_info_raw = driver.execute_script(f"return (function() {{ {page_info_js} }})()")
