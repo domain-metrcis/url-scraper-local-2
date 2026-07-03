@@ -4,12 +4,12 @@ URL Scraper Push-based Worker — local HTTP server that receives scrape request
 Exposes the same API as url-scraper-service:
   POST /url-scraper-service/api/v1/scrape/
 
-Callers push scrape tasks to this server. Each request navigates a browser
-to the target URL, executes the url-scraper.json workflow JS, and returns
-extracted data synchronously.
+Architecture: Single browser, single active tab, sequential request queue.
+All scrape requests are queued and processed one at a time to guarantee each
+page gets full browser focus and renders completely. No tab-focus issues.
 
 Usage:
-    python url_scraper.py [--port 8814] [--workers 3] [--chrome /path/to/chrome]
+    python url_scraper.py [--port 8814] [--headless] [--chrome /path/to/chrome]
                           [--extension /path/to/ext]
 """
 
@@ -17,6 +17,7 @@ import argparse
 import atexit
 import json
 import os
+import queue
 import shutil
 import signal
 import socket
@@ -32,7 +33,7 @@ from typing import Any, Dict, List, Optional
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_JSON_PATH = os.path.join(SCRIPT_DIR, "url-scraper.json")
 
-# Per-worker profile tracking
+# Profile tracking
 _CREATED_PROFILES: List[str] = []
 _PROFILES_LOCK = threading.Lock()
 
@@ -111,8 +112,8 @@ def detect_chrome_major(chrome_binary: Optional[str]) -> Optional[int]:
         return None
 
 
-def _create_profile(worker_id: int, extensions: Optional[List[str]] = None) -> str:
-    profile_id = f"urlscraper_w{worker_id}_{uuid.uuid4().hex[:8]}"
+def _create_profile(extensions: Optional[List[str]] = None) -> str:
+    profile_id = f"urlscraper_{uuid.uuid4().hex[:8]}"
     dest = os.path.join(tempfile.gettempdir(), profile_id)
     os.makedirs(dest, exist_ok=True)
     if extensions:
@@ -153,13 +154,13 @@ def _cleanup_all():
 atexit.register(_cleanup_all)
 
 
-def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
+def build_driver(headless: bool, chrome_binary: Optional[str],
                  version_main: Optional[int], extension_path: Optional[str] = None,
                  cf_autoclick_path: Optional[str] = None):
     import undetected_chromedriver as uc
 
     ext_sources = [p for p in [cf_autoclick_path, extension_path] if p and os.path.isdir(p)]
-    profile = _create_profile(worker_id, extensions=ext_sources)
+    profile = _create_profile(extensions=ext_sources)
 
     opts = uc.ChromeOptions()
     opts.page_load_strategy = "eager"
@@ -204,12 +205,15 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
 # --------------------------------------------------------------------------- #
 
 def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
-    """Navigate to target_url and run the url-scraper workflow JS."""
+    """Navigate to target_url and run the url-scraper workflow JS.
+    
+    This function assumes it has exclusive access to the browser — no other
+    tab or thread is competing for focus."""
     t0 = time.time()
     result: Dict[str, Any] = {"target_url": target_url, "status": "error"}
 
     try:
-        # Navigate to target URL with retry
+        # Navigate with retry (3 attempts)
         page_loaded = False
         for nav_attempt in range(3):
             try:
@@ -217,7 +221,6 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
                 page_loaded = True
                 break
             except Exception as nav_err:
-                # Navigation timeout or error — check if page partially loaded
                 try:
                     current = driver.current_url
                     if current and current != "about:blank" and "data:" not in current:
@@ -226,19 +229,20 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
                 except Exception:
                     pass
                 if nav_attempt < 2:
+                    print(f"  [nav] Attempt {nav_attempt+1} failed, retrying...")
                     time.sleep(3)
 
         if not page_loaded:
-            # Last resort: try once more with shorter timeout
             try:
                 driver.set_page_load_timeout(15)
                 driver.get(target_url)
+                page_loaded = True
             except Exception:
                 pass
             finally:
                 driver.set_page_load_timeout(30)
 
-        # Verify we're not still on about:blank
+        # Verify not stuck on about:blank
         try:
             current_url = driver.current_url
             if current_url == "about:blank" or not current_url:
@@ -247,7 +251,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Wait for body to appear
+        # Wait for body + readyState
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
@@ -257,7 +261,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
                 pass
             time.sleep(0.5)
 
-        # Detect Cloudflare challenge and wait for it to resolve (cf-autoclick handles it)
+        # Detect Cloudflare challenge and wait for cf-autoclick to solve it
         try:
             cf_deadline = time.time() + 20
             while time.time() < cf_deadline:
@@ -281,8 +285,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
 
         time.sleep(3)
 
-        # Wait for content to render (dynamic JS pages need more time)
-        # Try to detect when main content is loaded
+        # Smart content wait: poll until main content selector has content
         try:
             content_deadline = time.time() + 12
             while time.time() < content_deadline:
@@ -308,6 +311,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # Scroll to trigger lazy content
         time.sleep(1)
         try:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
@@ -315,11 +319,12 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
             pass
         time.sleep(2)
 
+        # Execute scraper workflow JS
         scraper_js = load_workflow_js(WORKFLOW_JSON_PATH)
         js_with_selectors = scraper_js.replace("${selectors_json}", selectors_json)
         scraped_data_raw = driver.execute_script(f"return (function() {{ {js_with_selectors} }})()")
 
-        # Check if content was extracted — if empty, wait more and retry (page may still be loading)
+        # Check if content was extracted
         has_content = False
         if scraped_data_raw:
             parsed_check = json.loads(scraped_data_raw) if isinstance(scraped_data_raw, str) else scraped_data_raw
@@ -331,8 +336,9 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
                             has_content = True
                             break
 
+        # Retry if empty (page may still be rendering)
         if not has_content:
-            # Retry after additional wait — page JS may still be rendering
+            print(f"  [retry] Content empty, waiting 5s and retrying extraction...")
             time.sleep(5)
             try:
                 driver.execute_script("window.scrollTo(0, 0)")
@@ -341,6 +347,7 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
             time.sleep(2)
             scraped_data_raw = driver.execute_script(f"return (function() {{ {js_with_selectors} }})()")
 
+        # Get page info
         page_info_js = load_page_info_js(WORKFLOW_JSON_PATH)
         page_info_raw = driver.execute_script(f"return (function() {{ {page_info_js} }})()")
 
@@ -360,23 +367,29 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Browser pool
+# Sequential Browser Worker
 # --------------------------------------------------------------------------- #
 
-class BrowserPool:
-    """Single browser, multi-tab with per-tab locking.
-    
-    1 Chrome instance with 8 pre-opened tabs. Each tab has its own lock.
-    A request acquires a free tab (lock), navigates to the URL, extracts
-    data, then navigates to about:blank and releases the lock.
-    
-    This avoids thread-safety issues because each tab is exclusively owned
-    by one thread at a time (via its dedicated lock)."""
+class ScrapeRequest:
+    """A scrape request with a result event for synchronous response."""
+    def __init__(self, target_url: str, selectors_json: str):
+        self.target_url = target_url
+        self.selectors_json = selectors_json
+        self.result: Optional[Dict[str, Any]] = None
+        self.event = threading.Event()
 
-    def __init__(self, size: int, headless: bool, chrome_bin: Optional[str],
+
+class SequentialBrowserWorker:
+    """Single browser, single tab, sequential queue.
+    
+    All requests go into a queue and are processed one by one.
+    Each page gets undivided browser attention — no tab focus issues.
+    The browser is recycled after N scrapes for memory health.
+    """
+
+    def __init__(self, headless: bool, chrome_bin: Optional[str],
                  version_main: Optional[int], extension_path: Optional[str],
                  cf_autoclick_path: Optional[str]):
-        self._max_tabs = size
         self._headless = headless
         self._chrome_bin = chrome_bin
         self._version_main = version_main
@@ -384,60 +397,36 @@ class BrowserPool:
         self._cf_autoclick_path = cf_autoclick_path
         self._driver = None
         self._profile = None
-        self._init_lock = threading.Lock()
-        # Each tab: {"handle": str, "lock": threading.Lock()}
-        self._tabs: List[Dict[str, Any]] = []
-        # Semaphore to limit concurrent tab usage
-        self._semaphore = threading.Semaphore(size)
-        # Queue of available tab indices
-        self._available: List[int] = []
-        self._queue_lock = threading.Lock()
         self._total_scrapes = 0
-        self._recycle_after = 200
+        self._recycle_after = 150  # Restart browser every 150 scrapes
+        self._queue: queue.Queue = queue.Queue()
+        self._running = True
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+        # Stats
+        self._queue_high_water = 0
+        self._total_processed = 0
+        self._total_errors = 0
 
     def _ensure_browser(self):
-        """Start browser and pre-open tabs."""
-        with self._init_lock:
-            if self._driver is not None:
-                try:
-                    _ = self._driver.title
-                    return
-                except Exception:
-                    self._force_restart()
+        """Start browser if not running."""
+        if self._driver is not None:
+            try:
+                _ = self._driver.title
+                return
+            except Exception:
+                self._kill_browser()
 
-            print(f"[BrowserPool] Starting browser with {self._max_tabs} tabs...")
-            self._driver, self._profile = build_driver(
-                0, self._headless, self._chrome_bin, self._version_main,
-                self._extension_path, self._cf_autoclick_path,
-            )
-            
-            # First tab already exists (the initial tab)
-            self._tabs = []
-            first_handle = self._driver.current_window_handle
-            self._tabs.append({"handle": first_handle, "lock": threading.Lock()})
-            
-            # Open remaining tabs
-            for i in range(1, self._max_tabs):
-                self._driver.execute_script("window.open('about:blank');")
-                time.sleep(0.3)
-            
-            # Collect all handles
-            all_handles = self._driver.window_handles
-            self._tabs = [{"handle": h, "lock": threading.Lock()} for h in all_handles[:self._max_tabs]]
-            
-            # Navigate all to blank
-            for tab in self._tabs:
-                self._driver.switch_to.window(tab["handle"])
-                self._driver.get("about:blank")
-            
-            # Mark all as available
-            self._available = list(range(len(self._tabs)))
-            self._total_scrapes = 0
-            
-            print(f"[BrowserPool] Ready: {len(self._tabs)} tabs pre-opened")
+        print(f"[Worker] Starting browser...")
+        self._driver, self._profile = build_driver(
+            self._headless, self._chrome_bin, self._version_main,
+            self._extension_path, self._cf_autoclick_path,
+        )
+        self._total_scrapes = 0
+        print(f"[Worker] Browser ready")
 
-    def _force_restart(self):
-        """Force restart the browser."""
+    def _kill_browser(self):
+        """Force kill browser."""
         if self._driver:
             try:
                 self._driver.quit()
@@ -447,77 +436,103 @@ class BrowserPool:
         if self._profile:
             _remove_profile(self._profile)
             self._profile = None
-        self._tabs = []
-        self._available = []
 
-    def acquire(self) -> tuple:
-        """Acquire a free tab. Returns (tab_index, tab_handle).
-        Blocks if all tabs are busy."""
-        self._semaphore.acquire()
-        self._ensure_browser()
-        
-        # Get a free tab index
-        with self._queue_lock:
-            if self._available:
-                idx = self._available.pop(0)
-            else:
-                # This shouldn't happen due to semaphore, but safety fallback
-                self._semaphore.release()
-                raise RuntimeError("No available tabs (semaphore leak)")
-        
-        # Lock this specific tab
-        self._tabs[idx]["lock"].acquire()
-        self._total_scrapes += 1
-        return (idx, self._tabs[idx]["handle"])
-
-    def get_driver(self):
-        return self._driver
-
-    def release(self, entry: tuple, broken: bool = False):
-        """Release the tab back to the pool."""
-        idx, handle = entry
-        try:
-            if not broken and self._driver:
-                try:
-                    # Switch to this tab and navigate to blank (free memory)
-                    self._driver.switch_to.window(handle)
-                    self._driver.get("about:blank")
-                except Exception:
-                    broken = True
-        except Exception:
-            pass
-        finally:
-            # Release tab lock
+    def _worker_loop(self):
+        """Main worker loop — processes requests sequentially."""
+        print(f"[Worker] Sequential queue worker started")
+        while self._running:
             try:
-                self._tabs[idx]["lock"].release()
-            except Exception:
-                pass
-            # Put back in available queue
-            with self._queue_lock:
-                if idx not in self._available:
-                    self._available.append(idx)
-            self._semaphore.release()
+                req: ScrapeRequest = self._queue.get(timeout=1)
+            except queue.Empty:
+                continue
 
-        # If broken or too many scrapes, schedule restart
-        if broken or self._total_scrapes >= self._recycle_after:
-            with self._init_lock:
-                if self._total_scrapes >= self._recycle_after:
-                    # Only restart when all tabs are free
-                    with self._queue_lock:
-                        if len(self._available) == len(self._tabs):
-                            print(f"[BrowserPool] Recycling after {self._total_scrapes} scrapes")
-                            self._force_restart()
+            # Process the request
+            try:
+                self._ensure_browser()
+
+                qsize = self._queue.qsize()
+                print(f"[Scrape] Processing: {req.target_url} (queue: {qsize} waiting)")
+
+                result = scrape_url(self._driver, req.target_url, req.selectors_json)
+                req.result = result
+                self._total_processed += 1
+                self._total_scrapes += 1
+
+                status_emoji = "✓" if result.get("status") == "completed" else "✗"
+                print(f"  [{status_emoji}] Done in {result.get('elapsed_seconds', 0)}s — {req.target_url[:80]}")
+
+            except Exception as e:
+                print(f"  [!] Error: {e}")
+                req.result = {
+                    "target_url": req.target_url,
+                    "status": "error",
+                    "error": str(e),
+                    "elapsed_seconds": 0,
+                }
+                self._total_errors += 1
+                # Browser might be broken — kill it so next request gets a fresh one
+                self._kill_browser()
+
+            finally:
+                req.event.set()  # Signal the waiting HTTP handler
+                self._queue.task_done()
+
+            # Recycle browser periodically for memory health
+            if self._total_scrapes >= self._recycle_after:
+                print(f"[Worker] Recycling browser after {self._total_scrapes} scrapes")
+                self._kill_browser()
+
+    def submit(self, target_url: str, selectors_json: str, timeout: float = 90) -> Dict[str, Any]:
+        """Submit a scrape request and wait for result.
+        
+        Args:
+            target_url: URL to scrape
+            selectors_json: JSON selectors string
+            timeout: Max seconds to wait (default 90s — enough for CF challenge + render)
+            
+        Returns:
+            Scrape result dict
+        """
+        req = ScrapeRequest(target_url, selectors_json)
+        self._queue.put(req)
+
+        # Track queue size
+        qsize = self._queue.qsize()
+        if qsize > self._queue_high_water:
+            self._queue_high_water = qsize
+
+        # Wait for the worker to process this request
+        if not req.event.wait(timeout=timeout):
+            return {
+                "target_url": target_url,
+                "status": "error",
+                "error": f"Scrape timed out after {timeout}s (queue congestion)",
+                "elapsed_seconds": timeout,
+            }
+
+        return req.result
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "queue_size": self._queue.qsize(),
+            "queue_high_water": self._queue_high_water,
+            "total_processed": self._total_processed,
+            "total_errors": self._total_errors,
+            "browser_alive": self._driver is not None,
+            "scrapes_since_recycle": self._total_scrapes,
+        }
 
     def shutdown(self):
-        self._force_restart()
+        self._running = False
+        self._kill_browser()
         _cleanup_all()
 
 
 # --------------------------------------------------------------------------- #
-# HTTP Server (Push endpoint)
+# HTTP Server
 # --------------------------------------------------------------------------- #
 
-def create_app(pool: BrowserPool):
+def create_app(worker: SequentialBrowserWorker):
     """Create Flask app with /url-scraper-service/api/v1/scrape/ endpoint."""
     from flask import Flask, request, jsonify
 
@@ -531,7 +546,7 @@ def create_app(pool: BrowserPool):
         if not target_url:
             return jsonify({"success": False, "error_message": "target_url required"}), 400
 
-        # If no selectors provided, use defaults to extract content
+        # Default selectors if none provided
         if not selectors:
             selectors = [
                 {"name": "source_title", "selector": "h1, title", "attribute": "text"},
@@ -543,7 +558,7 @@ def create_app(pool: BrowserPool):
                 {"name": "source_featured_image", "selector": "meta[property='og:image']", "attribute": "content"},
             ]
 
-        # Build selectors_json in the format the workflow expects
+        # Build selectors_json
         selectors_json = json.dumps([
             {
                 "name": s.get("name", ""),
@@ -558,19 +573,8 @@ def create_app(pool: BrowserPool):
             for s in selectors
         ])
 
-        entry = pool.acquire()
-        idx, handle = entry
-        driver = pool.get_driver()
-        broken = False
-        try:
-            # Switch to our exclusively-locked tab
-            driver.switch_to.window(handle)
-            result = scrape_url(driver, target_url, selectors_json)
-        except Exception as e:
-            broken = True
-            result = {"target_url": target_url, "status": "error", "error": str(e)}
-        finally:
-            pool.release((idx, handle), broken=broken)
+        # Submit to sequential queue and wait
+        result = worker.submit(target_url, selectors_json, timeout=90)
 
         # Parse scraped_data into variables
         variables = {}
@@ -584,10 +588,9 @@ def create_app(pool: BrowserPool):
                     if isinstance(item, dict) and item.get("name"):
                         variables[item["name"]] = item.get("value")
 
-        # Add raw page_source as page_html in scraped_data (for AI selector detection)
+        # Add page_html for AI selector detection
         page_source = result.get("page_source", "")
         if page_source:
-            # Truncate to 100K to keep response fast over the tunnel
             truncated_source = page_source[:100000] if len(page_source) > 100000 else page_source
             scraped_data.insert(0, {"name": "page_html", "selector": "html", "value": truncated_source})
             variables["page_html"] = truncated_source
@@ -617,14 +620,23 @@ def create_app(pool: BrowserPool):
     @app.route("/url-scraper-service/api/v1/health/", methods=["GET"])
     @app.route("/health/", methods=["GET"])
     def health():
-        return jsonify({"status": "healthy", "service": "url-scraper-local"})
+        stats = worker.get_stats()
+        return jsonify({
+            "status": "healthy",
+            "service": "url-scraper-local",
+            "architecture": "sequential-queue",
+            "stats": stats,
+        })
 
     @app.route("/", methods=["GET"])
     def root():
+        stats = worker.get_stats()
         return jsonify({
             "service": "url-scraper-local",
-            "version": "1.0.0",
+            "version": "2.0.0",
+            "architecture": "sequential-queue (single tab, full focus per page)",
             "docs": "POST /url-scraper-service/api/v1/scrape/",
+            "stats": stats,
         })
 
     return app
@@ -636,13 +648,13 @@ def create_app(pool: BrowserPool):
 
 def main():
     p = argparse.ArgumentParser(
-        description="URL Scraper — Push-based local worker. Runs an HTTP server "
-                    "that accepts scrape requests (same API as url-scraper-service).",
+        description="URL Scraper v2 — Sequential queue, single browser/tab. "
+                    "Each page gets full browser focus. No tab-switching issues.",
     )
     p.add_argument("--port", type=int, default=8814)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--headless", action="store_true")
-    p.add_argument("--workers", type=int, default=5, help="Max concurrent tabs (parallel scrapes)")
+    p.add_argument("--workers", type=int, default=1, help="(Ignored — kept for CLI compat)")
     p.add_argument("--chrome", help="Path to chrome/chromium binary")
     p.add_argument("--extension", help="Path to real-botxbyte-extension folder")
     args = p.parse_args()
@@ -674,25 +686,30 @@ def main():
     chrome_bin = args.chrome or find_chrome_binary()
     version_main = detect_chrome_major(chrome_bin)
 
-    print(f"[*] URL Scraper - Single Browser, Tab-Lock Pool (HTTP Server)")
-    print(f"[*] Listening: http://{args.host}:{args.port}")
-    print(f"[*] Endpoint: POST /url-scraper-service/api/v1/scrape/")
-    print(f"[*] Chrome: {chrome_bin}")
-    print(f"[*] CF-Autoclick: {cf_autoclick_path or 'none'}")
-    print(f"[*] Extension: {extension_path or 'none'}")
-    print(f"[*] Tabs: {args.workers} (each with exclusive lock)")
-    print(f"[*] Workflow: {WORKFLOW_JSON_PATH}")
-    print(f"[*] Architecture: 1 browser, {args.workers} pre-opened tabs, per-tab locking")
-    print()
+    print(f"╔══════════════════════════════════════════════════════════╗")
+    print(f"║  URL Scraper v2.0 — Sequential Queue Architecture       ║")
+    print(f"╠══════════════════════════════════════════════════════════╣")
+    print(f"║  Endpoint: POST /url-scraper-service/api/v1/scrape/     ║")
+    print(f"║  Mode: Single browser, single tab, sequential queue     ║")
+    print(f"║  Guarantee: Every page gets full browser focus           ║")
+    print(f"╚══════════════════════════════════════════════════════════╝")
+    print(f"")
+    print(f"  Listen:       http://{args.host}:{args.port}")
+    print(f"  Chrome:       {chrome_bin}")
+    print(f"  CF-Autoclick: {cf_autoclick_path or 'none'}")
+    print(f"  Extension:    {extension_path or 'none'}")
+    print(f"  Workflow:     {WORKFLOW_JSON_PATH}")
+    print(f"  Recycle:      every 150 scrapes")
+    print(f"")
 
-    pool = BrowserPool(
-        size=args.workers, headless=args.headless, chrome_bin=chrome_bin,
+    worker = SequentialBrowserWorker(
+        headless=args.headless, chrome_bin=chrome_bin,
         version_main=version_main, extension_path=extension_path,
         cf_autoclick_path=cf_autoclick_path,
     )
-    atexit.register(pool.shutdown)
+    atexit.register(worker.shutdown)
 
-    app = create_app(pool)
+    app = create_app(worker)
     app.run(host=args.host, port=args.port, threaded=True)
 
 
