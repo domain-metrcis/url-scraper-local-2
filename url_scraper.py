@@ -449,13 +449,35 @@ class SequentialBrowserWorker:
                 qsize = self._queue.qsize()
                 print(f"[Scrape] Processing: {req.target_url} (queue: {qsize} waiting)")
 
-                result = scrape_url(self._driver, req.target_url, req.selectors_json)
-                req.result = result
-                self._total_processed += 1
-                self._total_scrapes += 1
+                # Per-scrape timeout: if scrape takes > 45s, kill browser and fail
+                scrape_timed_out = False
+                def _timeout_handler():
+                    nonlocal scrape_timed_out
+                    scrape_timed_out = True
+                    print(f"  [!] Scrape timeout (45s) — killing browser")
+                    self._kill_browser()
 
-                status_emoji = "✓" if result.get("status") == "completed" else "✗"
-                print(f"  [{status_emoji}] Done in {result.get('elapsed_seconds', 0)}s — {req.target_url[:80]}")
+                timer = threading.Timer(45.0, _timeout_handler)
+                timer.start()
+                try:
+                    result = scrape_url(self._driver, req.target_url, req.selectors_json)
+                finally:
+                    timer.cancel()
+
+                if scrape_timed_out:
+                    req.result = {
+                        "target_url": req.target_url,
+                        "status": "error",
+                        "error": "Scrape timed out after 45s (browser killed)",
+                        "elapsed_seconds": 45,
+                    }
+                    self._total_errors += 1
+                else:
+                    req.result = result
+                    self._total_processed += 1
+                    self._total_scrapes += 1
+                    status_emoji = "✓" if result.get("status") == "completed" else "✗"
+                    print(f"  [{status_emoji}] Done in {result.get('elapsed_seconds', 0)}s — {req.target_url[:80]}")
 
             except Exception as e:
                 print(f"  [!] Error: {e}")
