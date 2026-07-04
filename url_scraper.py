@@ -343,6 +343,62 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
             time.sleep(3)
             scraped_data_raw = driver.execute_script(f"return (function() {{ {js_with_selectors} }})()")
 
+        # JSON-LD fallback: if still no content, try extracting from structured data
+        # (works for Next.js/React sites where content is in JSON-LD but not in DOM selectors)
+        has_content_after_retry = False
+        if scraped_data_raw:
+            parsed_retry = json.loads(scraped_data_raw) if isinstance(scraped_data_raw, str) else scraped_data_raw
+            if isinstance(parsed_retry, list):
+                for item in parsed_retry:
+                    if isinstance(item, dict) and item.get("name") == "source_content":
+                        val = item.get("value", "")
+                        if val and len(str(val)) > 200:
+                            has_content_after_retry = True
+                            break
+
+        if not has_content_after_retry:
+            print(f"  [json-ld] Trying JSON-LD extraction...")
+            try:
+                jsonld_data = driver.execute_script("""
+                    var scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (var i = 0; i < scripts.length; i++) {
+                        try {
+                            var data = JSON.parse(scripts[i].textContent);
+                            if (data.articleBody && data.articleBody.length > 100) {
+                                return JSON.stringify([
+                                    {name: "source_title", selector: "json-ld", value: data.headline || ""},
+                                    {name: "source_content", selector: "json-ld", value: "<p>" + data.articleBody.replace(/\\n\\n/g, "</p><p>").replace(/\\n/g, " ") + "</p>"},
+                                    {name: "source_author", selector: "json-ld", value: (data.author && data.author.name) || ""},
+                                    {name: "source_published_date", selector: "json-ld", value: data.datePublished || ""},
+                                    {name: "source_featured_image", selector: "json-ld", value: (data.image && data.image[0] && data.image[0].url) || (typeof data.image === 'string' ? data.image : "")},
+                                    {name: "source_meta_description", selector: "json-ld", value: data.description || ""}
+                                ]);
+                            }
+                            // Handle array of JSON-LD
+                            if (Array.isArray(data)) {
+                                for (var j = 0; j < data.length; j++) {
+                                    if (data[j].articleBody && data[j].articleBody.length > 100) {
+                                        var d = data[j];
+                                        return JSON.stringify([
+                                            {name: "source_title", selector: "json-ld", value: d.headline || ""},
+                                            {name: "source_content", selector: "json-ld", value: "<p>" + d.articleBody.replace(/\\n\\n/g, "</p><p>").replace(/\\n/g, " ") + "</p>"},
+                                            {name: "source_author", selector: "json-ld", value: (d.author && d.author.name) || ""},
+                                            {name: "source_published_date", selector: "json-ld", value: d.datePublished || ""},
+                                            {name: "source_featured_image", selector: "json-ld", value: (d.image && d.image[0] && d.image[0].url) || (typeof d.image === 'string' ? d.image : "")},
+                                            {name: "source_meta_description", selector: "json-ld", value: d.description || ""}
+                                        ]);
+                                    }
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    return null;
+                """)
+                if jsonld_data:
+                    scraped_data_raw = jsonld_data
+                    print(f"  [json-ld] ✓ Extracted content from JSON-LD structured data")
+            except Exception:
+                pass
         # Get page info
         page_info_js = load_page_info_js(WORKFLOW_JSON_PATH)
         page_info_raw = driver.execute_script(f"return (function() {{ {page_info_js} }})()")
