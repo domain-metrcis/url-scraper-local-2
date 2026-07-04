@@ -205,7 +205,7 @@ jobs:
 
       - name: Start URL Scraper
         run: |
-          echo "Starting url_scraper.py (sequential queue, single tab)..."
+          echo "Starting url_scraper.py (3 parallel browsers)..."
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           cd "$SCRAPER_DIR"
@@ -265,8 +265,8 @@ jobs:
           echo "🚀 Scraper API Tunnel: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
           echo "   POST ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}/url-scraper-service/api/v1/scrape/"
           echo ""
-          echo "📋 Architecture: Sequential queue — 1 browser, 1 tab, full focus per page"
-          echo "   No more empty content from tab-switching issues!"
+          echo "📋 Architecture: Multi-browser pool — 3 browsers, 1 tab each, parallel"
+          echo "   3x throughput, no more timeout issues!"
           echo ""
 
       - name: Keep Session Alive

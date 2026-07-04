@@ -487,17 +487,13 @@ class ScrapeRequest:
         self.event = threading.Event()
 
 
-class SequentialBrowserWorker:
-    """Single browser, single tab, sequential queue.
-    
-    All requests go into a queue and are processed one by one.
-    Each page gets undivided browser attention — no tab focus issues.
-    The browser is recycled after N scrapes for memory health.
-    """
+class BrowserInstance:
+    """A single isolated browser with its own queue and worker thread."""
 
-    def __init__(self, headless: bool, chrome_bin: Optional[str],
+    def __init__(self, instance_id: int, headless: bool, chrome_bin: Optional[str],
                  version_main: Optional[int], extension_path: Optional[str],
                  cf_autoclick_path: Optional[str]):
+        self.id = instance_id
         self._headless = headless
         self._chrome_bin = chrome_bin
         self._version_main = version_main
@@ -506,35 +502,30 @@ class SequentialBrowserWorker:
         self._driver = None
         self._profile = None
         self._total_scrapes = 0
-        self._recycle_after = 150  # Restart browser every 150 scrapes
+        self._recycle_after = 100
         self._queue: queue.Queue = queue.Queue()
         self._running = True
-        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker_thread.start()
-        # Stats
-        self._queue_high_water = 0
         self._total_processed = 0
         self._total_errors = 0
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
 
     def _ensure_browser(self):
-        """Start browser if not running."""
         if self._driver is not None:
             try:
                 _ = self._driver.title
                 return
             except Exception:
                 self._kill_browser()
-
-        print(f"[Worker] Starting browser...")
+        print(f"[Browser-{self.id}] Starting...")
         self._driver, self._profile = build_driver(
             self._headless, self._chrome_bin, self._version_main,
             self._extension_path, self._cf_autoclick_path,
         )
         self._total_scrapes = 0
-        print(f"[Worker] Browser ready")
+        print(f"[Browser-{self.id}] Ready")
 
     def _kill_browser(self):
-        """Force kill browser."""
         if self._driver:
             try:
                 self._driver.quit()
@@ -546,27 +537,24 @@ class SequentialBrowserWorker:
             self._profile = None
 
     def _worker_loop(self):
-        """Main worker loop — processes requests sequentially."""
-        print(f"[Worker] Sequential queue worker started")
+        print(f"[Browser-{self.id}] Worker thread started")
         while self._running:
             try:
                 req: ScrapeRequest = self._queue.get(timeout=1)
             except queue.Empty:
                 continue
 
-            # Process the request
             try:
                 self._ensure_browser()
-
                 qsize = self._queue.qsize()
-                print(f"[Scrape] Processing: {req.target_url} (queue: {qsize} waiting)")
+                print(f"[Browser-{self.id}] Processing: {req.target_url[:70]} (queue: {qsize})")
 
-                # Per-scrape timeout: if scrape takes > 45s, kill browser and fail
+                # Per-scrape timeout: kill browser after 45s
                 scrape_timed_out = False
                 def _timeout_handler():
                     nonlocal scrape_timed_out
                     scrape_timed_out = True
-                    print(f"  [!] Scrape timeout (45s) — killing browser")
+                    print(f"  [Browser-{self.id}] Timeout 45s — killing browser")
                     self._kill_browser()
 
                 timer = threading.Timer(45.0, _timeout_handler)
@@ -580,7 +568,7 @@ class SequentialBrowserWorker:
                     req.result = {
                         "target_url": req.target_url,
                         "status": "error",
-                        "error": "Scrape timed out after 45s (browser killed)",
+                        "error": "Scrape timed out after 45s",
                         "elapsed_seconds": 45,
                     }
                     self._total_errors += 1
@@ -588,11 +576,11 @@ class SequentialBrowserWorker:
                     req.result = result
                     self._total_processed += 1
                     self._total_scrapes += 1
-                    status_emoji = "✓" if result.get("status") == "completed" else "✗"
-                    print(f"  [{status_emoji}] Done in {result.get('elapsed_seconds', 0)}s — {req.target_url[:80]}")
+                    emoji = "✓" if result.get("status") == "completed" else "✗"
+                    print(f"  [Browser-{self.id}] [{emoji}] {result.get('elapsed_seconds', 0)}s — {req.target_url[:60]}")
 
             except Exception as e:
-                print(f"  [!] Error: {e}")
+                print(f"  [Browser-{self.id}] Error: {e}")
                 req.result = {
                     "target_url": req.target_url,
                     "status": "error",
@@ -600,38 +588,57 @@ class SequentialBrowserWorker:
                     "elapsed_seconds": 0,
                 }
                 self._total_errors += 1
-                # Browser might be broken — kill it so next request gets a fresh one
                 self._kill_browser()
-
             finally:
-                req.event.set()  # Signal the waiting HTTP handler
+                req.event.set()
                 self._queue.task_done()
 
-            # Recycle browser periodically for memory health
             if self._total_scrapes >= self._recycle_after:
-                print(f"[Worker] Recycling browser after {self._total_scrapes} scrapes")
+                print(f"[Browser-{self.id}] Recycling after {self._total_scrapes} scrapes")
                 self._kill_browser()
 
-    def submit(self, target_url: str, selectors_json: str, timeout: float = 90) -> Dict[str, Any]:
-        """Submit a scrape request and wait for result.
-        
-        Args:
-            target_url: URL to scrape
-            selectors_json: JSON selectors string
-            timeout: Max seconds to wait (default 90s — enough for CF challenge + render)
-            
-        Returns:
-            Scrape result dict
-        """
-        req = ScrapeRequest(target_url, selectors_json)
+    @property
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    def submit(self, req: ScrapeRequest):
         self._queue.put(req)
 
-        # Track queue size
-        qsize = self._queue.qsize()
-        if qsize > self._queue_high_water:
-            self._queue_high_water = qsize
+    def shutdown(self):
+        self._running = False
+        self._kill_browser()
 
-        # Wait for the worker to process this request
+
+class MultiBrowserPool:
+    """Multiple isolated browser instances with round-robin distribution.
+    
+    Each browser runs in its own thread with its own queue. Requests are
+    distributed to the browser with the shortest queue (least busy).
+    
+    3 browsers × 1 tab each = 3 parallel scrapes, each with full focus.
+    No tab-switching issues. 3x throughput vs single browser.
+    """
+
+    def __init__(self, num_instances: int, headless: bool, chrome_bin: Optional[str],
+                 version_main: Optional[int], extension_path: Optional[str],
+                 cf_autoclick_path: Optional[str]):
+        self._instances: List[BrowserInstance] = []
+        for i in range(num_instances):
+            instance = BrowserInstance(
+                i, headless, chrome_bin, version_main,
+                extension_path, cf_autoclick_path,
+            )
+            self._instances.append(instance)
+        print(f"[Pool] Started {num_instances} browser instances")
+
+    def submit(self, target_url: str, selectors_json: str, timeout: float = 90) -> Dict[str, Any]:
+        """Submit request to least-busy browser and wait for result."""
+        req = ScrapeRequest(target_url, selectors_json)
+
+        # Pick browser with shortest queue
+        best = min(self._instances, key=lambda b: b.queue_size)
+        best.submit(req)
+
         if not req.event.wait(timeout=timeout):
             return {
                 "target_url": target_url,
@@ -639,22 +646,24 @@ class SequentialBrowserWorker:
                 "error": f"Scrape timed out after {timeout}s (queue congestion)",
                 "elapsed_seconds": timeout,
             }
-
         return req.result
 
     def get_stats(self) -> Dict[str, Any]:
+        total_processed = sum(b._total_processed for b in self._instances)
+        total_errors = sum(b._total_errors for b in self._instances)
+        queues = [b.queue_size for b in self._instances]
         return {
-            "queue_size": self._queue.qsize(),
-            "queue_high_water": self._queue_high_water,
-            "total_processed": self._total_processed,
-            "total_errors": self._total_errors,
-            "browser_alive": self._driver is not None,
-            "scrapes_since_recycle": self._total_scrapes,
+            "instances": len(self._instances),
+            "queue_sizes": queues,
+            "total_queue": sum(queues),
+            "total_processed": total_processed,
+            "total_errors": total_errors,
+            "browsers_alive": [b._driver is not None for b in self._instances],
         }
 
     def shutdown(self):
-        self._running = False
-        self._kill_browser()
+        for b in self._instances:
+            b.shutdown()
         _cleanup_all()
 
 
@@ -662,7 +671,7 @@ class SequentialBrowserWorker:
 # HTTP Server
 # --------------------------------------------------------------------------- #
 
-def create_app(worker: SequentialBrowserWorker):
+def create_app(worker: MultiBrowserPool):
     """Create Flask app with /url-scraper-service/api/v1/scrape/ endpoint."""
     from flask import Flask, request, jsonify
 
@@ -754,7 +763,7 @@ def create_app(worker: SequentialBrowserWorker):
         return jsonify({
             "status": "healthy",
             "service": "url-scraper-local",
-            "architecture": "sequential-queue",
+            "architecture": "multi-browser-pool",
             "stats": stats,
         })
 
@@ -763,8 +772,8 @@ def create_app(worker: SequentialBrowserWorker):
         stats = worker.get_stats()
         return jsonify({
             "service": "url-scraper-local",
-            "version": "2.0.0",
-            "architecture": "sequential-queue (single tab, full focus per page)",
+            "version": "3.0.0",
+            "architecture": "multi-browser-pool (3 browsers, 1 tab each, parallel)",
             "docs": "POST /url-scraper-service/api/v1/scrape/",
             "stats": stats,
         })
@@ -778,13 +787,13 @@ def create_app(worker: SequentialBrowserWorker):
 
 def main():
     p = argparse.ArgumentParser(
-        description="URL Scraper v2 — Sequential queue, single browser/tab. "
-                    "Each page gets full browser focus. No tab-switching issues.",
+        description="URL Scraper v3 — Multi-browser pool. "
+                    "3 isolated browsers, 1 tab each, parallel processing. Full focus per page.",
     )
     p.add_argument("--port", type=int, default=8814)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--headless", action="store_true")
-    p.add_argument("--workers", type=int, default=1, help="(Ignored — kept for CLI compat)")
+    p.add_argument("--workers", type=int, default=3, help="Number of parallel browser instances (default 3)")
     p.add_argument("--chrome", help="Path to chrome/chromium binary")
     p.add_argument("--extension", help="Path to real-botxbyte-extension folder")
     args = p.parse_args()
@@ -816,23 +825,28 @@ def main():
     chrome_bin = args.chrome or find_chrome_binary()
     version_main = detect_chrome_major(chrome_bin)
 
+    num_browsers = args.workers  # Default 3 browser instances
+
     print(f"╔══════════════════════════════════════════════════════════╗")
-    print(f"║  URL Scraper v2.0 — Sequential Queue Architecture       ║")
+    print(f"║  URL Scraper v3.0 — Multi-Browser Pool                   ║")
     print(f"╠══════════════════════════════════════════════════════════╣")
     print(f"║  Endpoint: POST /url-scraper-service/api/v1/scrape/     ║")
-    print(f"║  Mode: Single browser, single tab, sequential queue     ║")
+    print(f"║  Mode: {num_browsers} browsers, 1 tab each, parallel processing       ║")
     print(f"║  Guarantee: Every page gets full browser focus           ║")
     print(f"╚══════════════════════════════════════════════════════════╝")
     print(f"")
     print(f"  Listen:       http://{args.host}:{args.port}")
+    print(f"  Browsers:     {num_browsers} parallel instances")
     print(f"  Chrome:       {chrome_bin}")
     print(f"  CF-Autoclick: {cf_autoclick_path or 'none'}")
     print(f"  Extension:    {extension_path or 'none'}")
     print(f"  Workflow:     {WORKFLOW_JSON_PATH}")
-    print(f"  Recycle:      every 150 scrapes")
+    print(f"  Recycle:      every 100 scrapes per browser")
+    print(f"  Throughput:   ~{num_browsers * 6}-{num_browsers * 10} URLs/min")
     print(f"")
 
-    worker = SequentialBrowserWorker(
+    worker = MultiBrowserPool(
+        num_instances=num_browsers,
         headless=args.headless, chrome_bin=chrome_bin,
         version_main=version_main, extension_path=extension_path,
         cf_autoclick_path=cf_autoclick_path,
