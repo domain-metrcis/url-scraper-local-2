@@ -241,50 +241,11 @@ jobs:
         env:
           SCRAPER_TUNNEL_URL: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}
         run: |
-          echo "Registering scraper tunnel URL to backend..."
-          TOKEN=$(curl -s "https://backend.articleinnovator.com/user-management-service/api/v1/auth/login/" \
+          echo "Registering scraper to backend (no auth required)..."
+          RESP=$(curl -s -X POST "https://backend.articleinnovator.com/article-management-service/api/v1/scraper-registry/register/" \
             -H "Content-Type: application/json" \
-            -d '{"email":"jaydeep@botxbyte.com","password":"Jaydeep@1234"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['access_token'])")
-
-          # Get current URLs array
-          CURRENT=$(curl -s "https://backend.articleinnovator.com/configuration-service/api/v1/system-variable/read/81d16f3c-1d6f-4c35-878a-05e665af6708/" \
-            -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('value','[]'))")
-
-          # Append this scraper URL to the array (remove dead ones, add new)
-          NEW_VALUE=$(python3 -c "
-          import json, urllib.request
-          current = '$CURRENT'
-          new_url = '$SCRAPER_TUNNEL_URL'
-          try:
-              urls = json.loads(current) if current.startswith('[') else [current] if current.startswith('http') else []
-          except:
-              urls = []
-          # Health check existing URLs, keep only alive ones
-          alive = []
-          for url in urls:
-              try:
-                  resp = urllib.request.urlopen(url.rstrip('/') + '/health/', timeout=5)
-                  if resp.status == 200:
-                      alive.append(url)
-              except:
-                  pass
-          # Add new URL if not already in list
-          if new_url and new_url not in alive:
-              alive.append(new_url)
-          print(json.dumps(alive))
-          ")
-
-          echo "Registering: $NEW_VALUE"
-
-          # Update the system variable with the new array
-          curl -s -X PATCH "https://backend.articleinnovator.com/configuration-service/api/v1/system-variable/update/81d16f3c-1d6f-4c35-878a-05e665af6708/" \
-            -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010" \
-            -H "Content-Type: application/json" \
-            -d "{\"value\":$(python3 -c "import json; print(json.dumps('$NEW_VALUE'))")}" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅ Registered:', d.get('message',''))"
-
-          echo "✅ Scraper registered: $SCRAPER_TUNNEL_URL"
+            -d "{\"scraper_url\": \"$SCRAPER_TUNNEL_URL\"}")
+          echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'✅ Registered: {d.get(\"message\",\"\")} — URLs: {d.get(\"registered_urls\",[])}' if d.get('success') else f'❌ Failed: {d}')"
 
       - name: Display Connection Info
         run: |
@@ -348,8 +309,20 @@ jobs:
       - name: Cleanup VNC
         if: always()
         timeout-minutes: 1
+        env:
+          SCRAPER_TUNNEL_URL: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}
         run: |
           export PATH=$PATH:/opt/TurboVNC/bin
+
+          # Deregister scraper URL from backend
+          if [ -n "$SCRAPER_TUNNEL_URL" ]; then
+            echo "Deregistering scraper URL..."
+            curl -s -X POST "https://backend.articleinnovator.com/article-management-service/api/v1/scraper-registry/deregister/" \
+              -H "Content-Type: application/json" \
+              -d "{\"scraper_url\": \"$SCRAPER_TUNNEL_URL\"}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'✅ Deregistered' if d.get('success') else f'⚠️ {d}')" 2>/dev/null || true
+          fi
+
           pkill -f "url_scraper.py" || true
           pkill -x cloudflared || true
           vncserver -kill :1 || true
