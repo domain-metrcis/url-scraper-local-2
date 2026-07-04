@@ -295,6 +295,62 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
         else:
             time.sleep(1)  # Brief settle for normal pages
 
+        # Early JSON-LD check — for JS-heavy sites (Next.js/React), content may only
+        # exist in structured data, not in DOM selectors. Extract early to avoid timeout.
+        _jsonld_extracted = None
+        try:
+            _jsonld_extracted = driver.execute_script("""
+                var scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                for (var i = 0; i < scripts.length; i++) {
+                    try {
+                        var data = JSON.parse(scripts[i].textContent);
+                        if (data.articleBody && data.articleBody.length > 100) {
+                            return {headline: data.headline||'', articleBody: data.articleBody,
+                                    author: (data.author&&data.author.name)||'', datePublished: data.datePublished||'',
+                                    image: (data.image&&data.image[0]&&data.image[0].url)||(typeof data.image==='string'?data.image:'')||'',
+                                    description: data.description||''};
+                        }
+                        if (Array.isArray(data)) {
+                            for (var j=0;j<data.length;j++) {
+                                if (data[j].articleBody && data[j].articleBody.length > 100) {
+                                    var d=data[j];
+                                    return {headline: d.headline||'', articleBody: d.articleBody,
+                                            author: (d.author&&d.author.name)||'', datePublished: d.datePublished||'',
+                                            image: (d.image&&d.image[0]&&d.image[0].url)||(typeof d.image==='string'?d.image:'')||'',
+                                            description: d.description||''};
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+                return null;
+            """)
+        except Exception:
+            pass
+
+        # If JSON-LD has content, use it directly (skip content wait + extraction)
+        if _jsonld_extracted and _jsonld_extracted.get("articleBody"):
+            print(f"  [json-ld] ✓ Fast extraction from JSON-LD ({len(_jsonld_extracted['articleBody'])} chars)")
+            body = _jsonld_extracted["articleBody"]
+            scraped_data_raw = json.dumps([
+                {"name": "source_title", "selector": "json-ld", "value": _jsonld_extracted.get("headline", "")},
+                {"name": "source_content", "selector": "json-ld", "value": "<p>" + body.replace("\n\n", "</p><p>").replace("\n", " ") + "</p>"},
+                {"name": "source_author", "selector": "json-ld", "value": _jsonld_extracted.get("author", "")},
+                {"name": "source_published_date", "selector": "json-ld", "value": _jsonld_extracted.get("datePublished", "")},
+                {"name": "source_featured_image", "selector": "json-ld", "value": _jsonld_extracted.get("image", "")},
+                {"name": "source_meta_description", "selector": "json-ld", "value": _jsonld_extracted.get("description", "")},
+            ])
+            page_info_js = load_page_info_js(WORKFLOW_JSON_PATH)
+            page_info_raw = driver.execute_script(f"return (function() {{ {page_info_js} }})()")
+            result["scraped_data"] = scraped_data_raw
+            result["page_info"] = page_info_raw
+            result["final_url"] = driver.current_url
+            result["page_source"] = ""  # Skip page_source for JSON-LD extraction (saves memory)
+            result["status"] = "completed"
+            result["elapsed_seconds"] = round(time.time() - t0, 2)
+            result["finished_at"] = datetime.now(timezone.utc).isoformat()
+            return result
+
         # Smart content wait — exit IMMEDIATELY when content found (poll every 0.5s)
         try:
             content_deadline = time.time() + 8
