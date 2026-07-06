@@ -805,42 +805,39 @@ def create_app(worker: MultiBrowserPool):
 
     @app.route("/url-scraper-service/api/v1/download-image/", methods=["POST"])
     def download_image():
-        """Download an image through the scraper's network (CF bypass).
+        """Download an image through the scraper's network.
         Returns the raw image bytes with proper content-type.
         """
         from flask import Response
-        import urllib.request
-        import ssl
-
-        body = request.get_json(force=True)
-        image_url = body.get("image_url", "")
-        if not image_url:
-            return jsonify({"success": False, "error": "image_url required"}), 400
+        import traceback
 
         try:
-            # Create request with browser-like headers
-            req = urllib.request.Request(image_url, headers={
+            body = request.get_json(force=True)
+            image_url = body.get("image_url", "")
+            if not image_url:
+                return jsonify({"success": False, "error": "image_url required"}), 400
+
+            import requests as _requests
+            resp = _requests.get(image_url, timeout=30, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                 "Accept": "image/*,*/*",
                 "Referer": "/".join(image_url.split("/")[:3]) + "/",
-            })
-            # Allow self-signed certs
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            }, allow_redirects=True, verify=False)
 
-            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
-            data = resp.read()
-            content_type = resp.headers.get("Content-Type", "image/jpeg")
-
-            if len(data) > 1000 and "image" in content_type:
-                return Response(data, mimetype=content_type, headers={
-                    "Content-Length": str(len(data)),
-                    "X-Original-URL": image_url[:200],
-                })
-            return jsonify({"success": False, "error": f"Not an image or too small ({len(data)} bytes)"}), 502
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                if "image" in content_type:
+                    return Response(resp.content, mimetype=content_type, headers={
+                        "Content-Length": str(len(resp.content)),
+                    })
+                else:
+                    return jsonify({"success": False, "error": f"Not image: {content_type}", "size": len(resp.content)}), 502
+            else:
+                return jsonify({"success": False, "error": f"HTTP {resp.status_code}", "size": len(resp.content)}), 502
         except Exception as e:
-            return jsonify({"success": False, "error": str(e)[:200]}), 500
+            tb = traceback.format_exc()
+            print(f"[download-image] ERROR: {tb}")
+            return jsonify({"success": False, "error": str(e)[:300]}), 500
 
     return app
 
