@@ -809,7 +809,8 @@ def create_app(worker: MultiBrowserPool):
         Returns the raw image bytes with proper content-type.
         """
         from flask import Response
-        import requests as _req
+        import urllib.request
+        import ssl
 
         body = request.get_json(force=True)
         image_url = body.get("image_url", "")
@@ -817,19 +818,27 @@ def create_app(worker: MultiBrowserPool):
             return jsonify({"success": False, "error": "image_url required"}), 400
 
         try:
-            resp = _req.get(image_url, timeout=30, headers={
+            # Create request with browser-like headers
+            req = urllib.request.Request(image_url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                 "Accept": "image/*,*/*",
                 "Referer": "/".join(image_url.split("/")[:3]) + "/",
-            }, allow_redirects=True)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                content_type = resp.headers.get("content-type", "image/jpeg")
-                if "image" in content_type:
-                    return Response(resp.content, mimetype=content_type, headers={
-                        "Content-Length": str(len(resp.content)),
-                        "X-Original-URL": image_url[:200],
-                    })
-            return jsonify({"success": False, "error": f"HTTP {resp.status_code}", "size": len(resp.content)}), 502
+            })
+            # Allow self-signed certs
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "image/jpeg")
+
+            if len(data) > 1000 and "image" in content_type:
+                return Response(data, mimetype=content_type, headers={
+                    "Content-Length": str(len(data)),
+                    "X-Original-URL": image_url[:200],
+                })
+            return jsonify({"success": False, "error": f"Not an image or too small ({len(data)} bytes)"}), 502
         except Exception as e:
             return jsonify({"success": False, "error": str(e)[:200]}), 500
 
