@@ -204,9 +204,13 @@ def build_driver(headless: bool, chrome_binary: Optional[str],
 # Scrape logic
 # --------------------------------------------------------------------------- #
 
-def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
+def scrape_url(driver, target_url: str, selectors_json: str, wait_for: str = "") -> Dict[str, Any]:
     """Navigate to target_url and run the url-scraper workflow JS.
     
+    Args:
+        wait_for: CSS selector to wait for before capturing page (for JS-rendered pages).
+                  If set, waits up to 15s for element matching this selector to appear.
+
     Optimized for speed with aggressive early-exit:
     - Skip CF wait if no challenge detected (saves 20s)
     - Exit content wait immediately when content found (saves 5-10s)
@@ -294,6 +298,25 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
             time.sleep(1)
         else:
             time.sleep(1)  # Brief settle for normal pages
+
+        # wait_for: wait for a specific CSS selector to appear (for JS-rendered listing pages)
+        if wait_for:
+            print(f"  [wait_for] Waiting for '{wait_for}' to appear...")
+            wf_deadline = time.time() + 15
+            while time.time() < wf_deadline:
+                try:
+                    found = driver.execute_script(f"""
+                        var els = document.querySelectorAll('{wait_for}');
+                        return els.length >= 3;
+                    """)
+                    if found:
+                        print(f"  [wait_for] Elements found!")
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                print(f"  [wait_for] Timeout waiting for '{wait_for}'")
 
         # Early JSON-LD check — for JS-heavy sites (Next.js/React), content may only
         # exist in structured data, not in DOM selectors. Extract early to avoid timeout.
@@ -480,9 +503,10 @@ def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
 
 class ScrapeRequest:
     """A scrape request with a result event for synchronous response."""
-    def __init__(self, target_url: str, selectors_json: str):
+    def __init__(self, target_url: str, selectors_json: str, wait_for: str = ""):
         self.target_url = target_url
         self.selectors_json = selectors_json
+        self.wait_for = wait_for
         self.result: Optional[Dict[str, Any]] = None
         self.event = threading.Event()
 
@@ -560,7 +584,7 @@ class BrowserInstance:
                 timer = threading.Timer(45.0, _timeout_handler)
                 timer.start()
                 try:
-                    result = scrape_url(self._driver, req.target_url, req.selectors_json)
+                    result = scrape_url(self._driver, req.target_url, req.selectors_json, req.wait_for)
                 finally:
                     timer.cancel()
 
@@ -631,9 +655,9 @@ class MultiBrowserPool:
             self._instances.append(instance)
         print(f"[Pool] Started {num_instances} browser instances")
 
-    def submit(self, target_url: str, selectors_json: str, timeout: float = 90) -> Dict[str, Any]:
+    def submit(self, target_url: str, selectors_json: str, timeout: float = 90, wait_for: str = "") -> Dict[str, Any]:
         """Submit request to least-busy browser and wait for result."""
-        req = ScrapeRequest(target_url, selectors_json)
+        req = ScrapeRequest(target_url, selectors_json, wait_for)
 
         # Pick browser with shortest queue
         best = min(self._instances, key=lambda b: b.queue_size)
@@ -682,6 +706,7 @@ def create_app(worker: MultiBrowserPool):
         body = request.get_json(force=True)
         target_url = body.get("target_url", "")
         selectors = body.get("selectors", [])
+        wait_for = body.get("wait_for", "")  # CSS selector to wait for before capture
         if not target_url:
             return jsonify({"success": False, "error_message": "target_url required"}), 400
 
@@ -713,7 +738,7 @@ def create_app(worker: MultiBrowserPool):
         ])
 
         # Submit to sequential queue and wait
-        result = worker.submit(target_url, selectors_json, timeout=90)
+        result = worker.submit(target_url, selectors_json, timeout=90, wait_for=wait_for)
 
         # Parse scraped_data into variables
         variables = {}
