@@ -755,7 +755,7 @@ def create_app(worker: MultiBrowserPool):
         # Add page_html for AI selector detection
         page_source = result.get("page_source", "")
         if page_source:
-            truncated_source = page_source[:100000] if len(page_source) > 100000 else page_source
+            truncated_source = page_source[:500000] if len(page_source) > 500000 else page_source
             scraped_data.insert(0, {"name": "page_html", "selector": "html", "value": truncated_source})
             variables["page_html"] = truncated_source
 
