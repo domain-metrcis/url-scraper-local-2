@@ -381,13 +381,14 @@ def metrics():
 # --------------------------------------------------------------------------- #
 
 def main():
+    global MAX_CONCURRENT, SCRAPE_TIMEOUT, executor
+
     parser = argparse.ArgumentParser(description="URL Scraper (Fresh Chrome per request)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--max-concurrent", type=int, default=MAX_CONCURRENT)
     parser.add_argument("--timeout", type=int, default=SCRAPE_TIMEOUT)
     args = parser.parse_args()
 
-    global MAX_CONCURRENT, SCRAPE_TIMEOUT, executor
     MAX_CONCURRENT = args.max_concurrent
     SCRAPE_TIMEOUT = args.timeout
     executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
