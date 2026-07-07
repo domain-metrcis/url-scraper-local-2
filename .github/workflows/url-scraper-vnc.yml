@@ -149,7 +149,7 @@ jobs:
           cloudflared --version
           echo "✅ cloudflared installed"
 
-      - name: Start Cloudflare Quick Tunnel
+      - name: Start Cloudflare Quick Tunnel (VNC)
         id: tunnel
         run: |
           echo "Starting Cloudflare quick tunnel for noVNC..."
@@ -189,7 +189,7 @@ jobs:
           echo "scraper_tunnel_url=$SCRAPER_TUNNEL_URL" >> $GITHUB_OUTPUT
           echo "✅ Scraper tunnel ready: $SCRAPER_TUNNEL_URL"
 
-      - name: Setup vendored chromium + cf-autoclick extension
+      - name: Setup vendored chromium + extensions
         timeout-minutes: 5
         run: |
           echo "[*] Populating $SCRAPER_DIR/vendor/ ..."
@@ -201,144 +201,165 @@ jobs:
 
           test -x vendor/ungoogled-chromium/chrome \
             || { echo "❌ vendor/ungoogled-chromium/chrome missing"; exit 1; }
-          test -f vendor/cf-autoclick/manifest.json \
-            || { echo "❌ vendor/cf-autoclick/manifest.json missing"; exit 1; }
           test -f vendor/real-botxbyte-extension/manifest.json \
             || { echo "❌ vendor/real-botxbyte-extension/manifest.json missing"; exit 1; }
-          echo "✅ Vendor setup complete (with real-botxbyte-extension)"
+          echo "✅ Vendor setup complete"
 
-      - name: Start URL Scraper
+      - name: Install Python dependencies
         run: |
-          echo "Starting url_scraper.py (1 worker)..."
-          export DISPLAY=:1
-          export NO_AT_BRIDGE=1
           cd "$SCRAPER_DIR"
           python3 -m venv .venv
           source .venv/bin/activate
-          pip install --no-cache-dir undetected-chromedriver requests setuptools flask
-          nohup python3 url_scraper.py --workers 1 > /tmp/url-scraper.log 2>&1 &
-          SCRAPER_PID=$!
-          echo "  Scraper PID: $SCRAPER_PID"
+          pip install --no-cache-dir flask requests aiohttp websockets boto3 faster-whisper
+
+      - name: Launch Chromium with real-botxbyte-extension
+        run: |
+          export DISPLAY=:1
+          export NO_AT_BRIDGE=1
+          cd "$SCRAPER_DIR"
+
+          CHROME_BIN="$SCRAPER_DIR/vendor/ungoogled-chromium/chrome"
+          EXT_PATH="$SCRAPER_DIR/vendor/real-botxbyte-extension"
+          PROFILE_DIR="/tmp/chrome-profile-scraper"
+          mkdir -p "$PROFILE_DIR"
+
+          # Launch ungoogled-chromium with the extension loaded
+          nohup "$CHROME_BIN" \
+            --user-data-dir="$PROFILE_DIR" \
+            --load-extension="$EXT_PATH" \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-background-networking \
+            --disable-sync \
+            --disable-translate \
+            --disable-features=TranslateUI \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            > /tmp/chrome.log 2>&1 &
+
+          CHROME_PID=$!
+          echo "  Chrome PID: $CHROME_PID"
           sleep 5
 
+          if kill -0 $CHROME_PID 2>/dev/null; then
+            echo "✅ Chromium launched with real-botxbyte-extension (PID: $CHROME_PID)"
+          else
+            echo "❌ Chrome failed to start"; cat /tmp/chrome.log; exit 1
+          fi
+
+      - name: Start server.py (Extension Bridge)
+        run: |
+          cd "$SCRAPER_DIR"
+          source .venv/bin/activate
+
+          # Start server.py which connects to extension via WebSocket
+          export MAX_TABS=10
+          export MAX_QUEUE=30
+          nohup python3 real-botxbyte-extension/server.py > /tmp/server-py.log 2>&1 &
+          SERVER_PID=$!
+          echo "  server.py PID: $SERVER_PID"
+          sleep 5
+
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            echo "✅ server.py started (PID: $SERVER_PID) — WS:8765 HTTP:8766"
+          else
+            echo "❌ server.py failed"; cat /tmp/server-py.log; exit 1
+          fi
+
+          # Wait for extension to connect via WebSocket
+          echo "Waiting for extension WebSocket connection..."
+          for i in $(seq 1 30); do
+            if grep -q "Extension connected" /tmp/server-py.log 2>/dev/null; then
+              echo "✅ Extension connected to server.py"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Start URL Scraper API (Flask proxy)
+        run: |
+          cd "$SCRAPER_DIR"
+          source .venv/bin/activate
+
+          nohup python3 url_scraper.py --port 8814 --extension-server http://localhost:8766 > /tmp/url-scraper.log 2>&1 &
+          SCRAPER_PID=$!
+          echo "  url_scraper.py PID: $SCRAPER_PID"
+          sleep 3
+
           if kill -0 $SCRAPER_PID 2>/dev/null; then
-            echo "✅ URL scraper started (PID: $SCRAPER_PID)"
+            echo "✅ URL Scraper API started (PID: $SCRAPER_PID) on port 8814"
           else
-            echo "❌ URL scraper failed to start"; cat /tmp/url-scraper.log; exit 1
+            echo "❌ URL Scraper failed"; cat /tmp/url-scraper.log; exit 1
           fi
 
-      - name: Test scraper with sample URL
+      - name: Test scraper health
         run: |
-          echo "Testing scraper with a sample URL..."
-          sleep 10
-          RESPONSE=$(curl -s -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
-            -H "Content-Type: application/json" \
-            -d '{"target_url": "https://example.com"}')
-          echo "Response: $RESPONSE"
-          if echo "$RESPONSE" | grep -q '"status"'; then
-            echo "✅ Scraper test passed!"
-          else
-            echo "⚠️ Unexpected response, but scraper is running"
-          fi
+          sleep 5
+          echo "Testing health endpoint..."
+          curl -s http://localhost:8814/url-scraper-service/api/v1/health/ | python3 -m json.tool
+          echo "✅ Health check passed"
 
-      - name: Update Backend with Scraper Tunnel URL
-        env:
-          SCRAPER_TUNNEL_URL: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}
+      - name: Test scrape with sample URL
         run: |
-          echo "Updating cloudflare_tunnel_url in backend..."
-          TOKEN=$(curl -s "https://backend.articleinnovator.com/user-management-service/api/v1/auth/login/" \
+          echo "Testing scrape with example.com..."
+          RESULT=$(curl -s -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
             -H "Content-Type: application/json" \
-            -d '{"email":"jaydeep@botxbyte.com","password":"Jaydeep@1234"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['access_token'])")
-
-          # Find the system variable ID
-          VAR_DATA=$(curl -s "https://backend.articleinnovator.com/configuration-service/api/v1/system-variables/?search=cloudflare_tunnel_url&limit=10" \
-            -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010")
-          VAR_ID=$(echo "$VAR_DATA" | python3 -c "
+            -d '{"target_url": "https://example.com", "selectors": []}')
+          echo "$RESULT" | python3 -c "
           import sys, json
-          data = json.load(sys.stdin)
-          for item in data.get('data', []):
-              if item.get('key') == 'cloudflare_tunnel_url':
-                  print(item['system_variable_id'])
-                  break
-          " 2>/dev/null)
+          d = json.load(sys.stdin)
+          print(f'Success: {d.get(\"success\")}')
+          vars = d.get('data', {}).get('variables', {})
+          print(f'Title: {vars.get(\"source_title\", \"\")}')
+          print(f'Content length: {len(vars.get(\"source_content\", \"\"))} chars')
+          "
+          echo "✅ Scrape test passed"
 
-          if [ -n "$VAR_ID" ]; then
-            curl -s -X PATCH "https://backend.articleinnovator.com/configuration-service/api/v1/system-variable/update/$VAR_ID/" \
-              -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010" \
-              -H "Content-Type: application/json" \
-              -d "{\"value\":\"$SCRAPER_TUNNEL_URL\"}" | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅ Updated:', d.get('data',{}).get('value',''))"
-          else
-            curl -s -X POST "https://backend.articleinnovator.com/configuration-service/api/v1/system-variable/create/" \
-              -H "Authorization: Bearer $TOKEN" -H "workspace-id: 00000000-0000-0000-0000-000000000010" \
-              -H "Content-Type: application/json" \
-              -d "{\"name\":\"Cloudflare Tunnel URL\",\"key\":\"cloudflare_tunnel_url\",\"value\":\"$SCRAPER_TUNNEL_URL\",\"description\":\"Cloudflare tunnel URL for push-based scraping\",\"is_readonly\":false}" \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print('✅ Created:', d.get('data',{}).get('value',''))"
-          fi
-
-      - name: Display Connection Info
+      - name: Print connection info
         run: |
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║           🎉 URL SCRAPER VNC IS RUNNING! 🎉                  ║"
+          echo "║              URL SCRAPER (Extension-based) READY            ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║ Scraper API: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
+          echo "║ VNC URL:     ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "║ VNC Pass:    botxbyte123"
+          echo "║ Architecture: ungoogled-chromium + real-botxbyte-extension"
+          echo "║ Max Tabs:    10 parallel"
+          echo "║ Max Queue:   30 pending"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
-          echo "🌐 VNC Access URL: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
-          echo "🔑 Password: botxbyte123"
-          echo ""
-          echo "🚀 Scraper API Tunnel: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
-          echo "   POST ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}/url-scraper-service/api/v1/scrape/"
-          echo ""
-          echo "🐍 url_scraper.py running with: --workers 1 (push-based via tunnel)"
-          echo ""
 
-      - name: Keep Session Alive
+      - name: Keep alive (6 hours)
         run: |
-          export PATH=$PATH:/opt/TurboVNC/bin
-          set +e
-          echo "Keeping VNC session alive..."
-
-          while true; do
-            echo "🌐 VNC: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html | Password: botxbyte123"
-            echo "🚀 Scraper: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
-
-            # Restart VNC if it died
-            if ! pgrep -f "Xvnc.*:1" > /dev/null; then
-              echo "❌ VNC stopped! Restarting..."
-              vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT
-              sleep 3
+          echo "Scraper running. Will stay alive for 6 hours..."
+          echo "Scraper tunnel: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
+          
+          # Health check loop
+          FAILURES=0
+          for i in $(seq 1 2160); do
+            sleep 10
+            
+            # Check scraper health every 10 seconds
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8814/url-scraper-service/api/v1/health/ 2>/dev/null || echo "000")
+            
+            if [ "$HTTP_CODE" != "200" ]; then
+              FAILURES=$((FAILURES + 1))
+              echo "[$(date)] ⚠️ Health check failed (HTTP $HTTP_CODE) — failure #$FAILURES"
+              
+              if [ $FAILURES -ge 3 ]; then
+                echo "❌ 3 consecutive health failures. Checking components..."
+                echo "--- Chrome ---"
+                pgrep -a chrome | head -3 || echo "Chrome not running!"
+                echo "--- server.py ---"
+                pgrep -af server.py || echo "server.py not running!"
+                echo "--- url_scraper.py ---"
+                pgrep -af url_scraper.py || echo "url_scraper.py not running!"
+                echo "--- server.py log (last 10) ---"
+                tail -10 /tmp/server-py.log
+                FAILURES=0
+              fi
+            else
+              FAILURES=0
             fi
-
-            # Restart tunnels if they died
-            TUNNEL_COUNT=$(pgrep -cx "cloudflared")
-            if [ "$TUNNEL_COUNT" -lt 2 ]; then
-              echo "❌ Tunnel(s) stopped! Restarting..."
-              pkill -x cloudflared || true
-              sleep 2
-              cloudflared tunnel --no-autoupdate --url http://localhost:$NOVNC_PORT > /tmp/tunnel.log 2>&1 &
-              cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/scraper-tunnel.log 2>&1 &
-              sleep 5
-            fi
-
-            # Restart scraper if it died
-            if ! pgrep -f "url_scraper.py" > /dev/null; then
-              echo "⚠️ URL scraper stopped! Restarting..."
-              export DISPLAY=:1
-              export NO_AT_BRIDGE=1
-              cd "$SCRAPER_DIR"
-              source .venv/bin/activate
-              nohup python3 url_scraper.py --workers 1 > /tmp/url-scraper.log 2>&1 &
-              sleep 3
-            fi
-
-            sleep 30
           done
-
-      - name: Cleanup VNC
-        if: always()
-        timeout-minutes: 1
-        run: |
-          export PATH=$PATH:/opt/TurboVNC/bin
-          pkill -f "url_scraper.py" || true
-          pkill -x cloudflared || true
-          vncserver -kill :1 || true
-          echo "✅ Cleanup complete"

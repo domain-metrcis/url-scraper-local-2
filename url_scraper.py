@@ -1,453 +1,290 @@
 """
-URL Scraper Push-based Worker — local HTTP server that receives scrape requests.
+URL Scraper — Extension-based worker using real-botxbyte-extension.
 
 Exposes the same API as url-scraper-service:
   POST /url-scraper-service/api/v1/scrape/
+  GET  /url-scraper-service/api/v1/health/
 
-Callers push scrape tasks to this server. Each request navigates a browser
-to the target URL, executes the url-scraper.json workflow JS, and returns
-extracted data synchronously.
+Architecture:
+  1. Receives scrape request (target_url + selectors)
+  2. Builds a workflow JSON from the url-scraper.json template
+  3. Sends workflow to server.py (port 8766) which forwards to extension via WebSocket
+  4. Extension opens a new tab, navigates, handles CF/cookies, extracts data
+  5. Returns result synchronously (server.py manages tab semaphore + queue)
 
-Usage:
-    python url_scraper.py [--port 8814] [--workers 3] [--chrome /path/to/chrome]
-                          [--extension /path/to/ext]
+No CDP, no undetected-chromedriver, no crashes.
+The extension handles CF turnstile, cookie consent, CSP stripping natively.
 """
 
 import argparse
-import atexit
 import json
 import os
-import shutil
-import signal
-import socket
 import sys
-import tempfile
-import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKFLOW_JSON_PATH = os.path.join(SCRIPT_DIR, "url-scraper.json")
+import requests
+from flask import Flask, jsonify, request as flask_request
 
-# Per-worker profile tracking
-_CREATED_PROFILES: List[str] = []
-_PROFILES_LOCK = threading.Lock()
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+WORKFLOW_TEMPLATE_PATH = SCRIPT_DIR / "url-scraper.json"
+EXTENSION_SERVER_URL = os.getenv("EXTENSION_SERVER_URL", "http://localhost:8766")
+DEFAULT_PORT = int(os.getenv("SCRAPER_PORT", "8814"))
+REQUEST_TIMEOUT = int(os.getenv("SCRAPER_TIMEOUT", "120"))  # seconds
+
+app = Flask(__name__)
+
+# Stats
+_stats = {
+    "total_processed": 0,
+    "total_errors": 0,
+    "total_queue": 0,
+    "started_at": time.time(),
+}
 
 
 # --------------------------------------------------------------------------- #
-# Workflow JS loader
+# Workflow Builder
 # --------------------------------------------------------------------------- #
 
-def load_workflow_js(spec_path: str) -> str:
-    """Load the evaluate script from url-scraper.json workflow."""
-    with open(spec_path, "r", encoding="utf-8") as fh:
-        spec = json.load(fh)
-    actions = spec.get("actions", [])
-    for action in reversed(actions):
-        if action.get("type") == "evaluate" and action.get("set_variable") == "scraped_data":
-            return action["script"]
-    evals = [a for a in actions if a.get("type") == "evaluate"]
-    if evals:
-        return evals[-1]["script"]
-    raise RuntimeError(f"{spec_path} has no evaluate actions")
+def _load_workflow_template() -> dict:
+    """Load the url-scraper.json workflow template."""
+    with open(WORKFLOW_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def load_page_info_js(spec_path: str) -> str:
-    """Load the page_info evaluate script."""
-    with open(spec_path, "r", encoding="utf-8") as fh:
-        spec = json.load(fh)
-    for action in spec.get("actions", []):
-        if action.get("type") == "evaluate" and action.get("set_variable") == "page_info":
-            return action["script"]
-    return "return JSON.stringify({ title: document.title, url: window.location.href, domain: window.location.hostname })"
-
-
-# --------------------------------------------------------------------------- #
-# Browser helpers
-# --------------------------------------------------------------------------- #
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def find_chrome_binary() -> Optional[str]:
-    import platform
-    system = platform.system()
-    if system == "Linux":
-        candidates = [
-            os.path.join(SCRIPT_DIR, "vendor", "ungoogled-chromium", "chrome"),
-            "/usr/bin/ungoogled-chromium",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/google-chrome",
+def build_scrape_workflow(target_url: str, selectors: List[Dict[str, Any]]) -> dict:
+    """
+    Build a workflow JSON for the extension to execute.
+    
+    If selectors are provided, uses them for extraction.
+    If empty, uses default selectors that extract page_html + basic meta.
+    """
+    template = _load_workflow_template()
+    
+    # Default selectors when none provided — extract full page HTML + meta
+    if not selectors:
+        selectors = [
+            {"name": "source_title", "selector": "title", "js_query": "document.title", "is_multiple_value": False, "remove_selector": [], "is_external_link": False, "is_internal_link": False},
+            {"name": "source_content", "selector": "article, .article-body, .post-content, .entry-content, [role='main'] p, main p", "js_query": "(() => { const s = document.querySelector('article') || document.querySelector('.article-body') || document.querySelector('.post-content') || document.querySelector('.entry-content') || document.querySelector('[role=\"main\"]') || document.querySelector('main'); return s ? s.innerText : document.body.innerText.substring(0, 50000); })()", "is_multiple_value": False, "remove_selector": ["script", "style", "nav", "header", "footer", "aside", "ins", "iframe"], "is_external_link": False, "is_internal_link": False},
+            {"name": "source_author", "selector": "meta[name='author'], [rel='author'], .author-name", "js_query": "document.querySelector('meta[name=\"author\"]')?.content || document.querySelector('[rel=\"author\"]')?.textContent?.trim() || ''", "is_multiple_value": False, "remove_selector": [], "is_external_link": False, "is_internal_link": False},
+            {"name": "source_published_date", "selector": "meta[property='article:published_time'], time[datetime]", "js_query": "document.querySelector('meta[property=\"article:published_time\"]')?.content || document.querySelector('time[datetime]')?.getAttribute('datetime') || ''", "is_multiple_value": False, "remove_selector": [], "is_external_link": False, "is_internal_link": False},
+            {"name": "source_featured_image", "selector": "meta[property='og:image']", "js_query": "document.querySelector('meta[property=\"og:image\"]')?.content || ''", "is_multiple_value": False, "remove_selector": [], "is_external_link": False, "is_internal_link": False},
+            {"name": "source_excerpt", "selector": "meta[name='description'], meta[property='og:description']", "js_query": "document.querySelector('meta[name=\"description\"]')?.content || document.querySelector('meta[property=\"og:description\"]')?.content || ''", "is_multiple_value": False, "remove_selector": [], "is_external_link": False, "is_internal_link": False},
         ]
-    elif system == "Darwin":
-        candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
-    else:
-        candidates = []
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
+
+    # Set variables in the workflow
+    template["variables"] = {
+        "target_url": target_url,
+        "selectors_json": json.dumps(selectors),
+    }
+    
+    # Ensure options are set for new tab + close on completion
+    template["options"] = {
+        "new_tab": True,
+        "close_tab": True,
+        "close_tab_on_error": True,
+    }
+    
+    return template
 
 
-def detect_chrome_major(chrome_binary: Optional[str]) -> Optional[int]:
-    import subprocess, re
-    if not chrome_binary:
-        return None
+# --------------------------------------------------------------------------- #
+# Extension Communication
+# --------------------------------------------------------------------------- #
+
+def send_workflow_to_extension(workflow: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
+    """
+    Send workflow to server.py (synchronous mode).
+    Returns the extension's result dict.
+    """
     try:
-        out = subprocess.check_output([chrome_binary, "--version"], text=True, timeout=5)
-        m = re.search(r"(\d+)\.", out)
-        return int(m.group(1)) if m else None
-    except Exception:
-        return None
-
-
-def _create_profile(worker_id: int, extensions: Optional[List[str]] = None) -> str:
-    profile_id = f"urlscraper_w{worker_id}_{uuid.uuid4().hex[:8]}"
-    dest = os.path.join(tempfile.gettempdir(), profile_id)
-    os.makedirs(dest, exist_ok=True)
-    if extensions:
-        ext_base = os.path.join(dest, "Extensions")
-        os.makedirs(ext_base, exist_ok=True)
-        for ext_path in extensions:
-            if ext_path and os.path.isdir(ext_path):
-                ext_name = os.path.basename(os.path.realpath(ext_path))
-                ext_dest = os.path.join(ext_base, ext_name)
-                shutil.copytree(ext_path, ext_dest, dirs_exist_ok=True)
-    with _PROFILES_LOCK:
-        _CREATED_PROFILES.append(dest)
-    return dest
-
-
-def _remove_profile(path: Optional[str]) -> None:
-    if not path:
-        return
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
-    with _PROFILES_LOCK:
-        try:
-            _CREATED_PROFILES.remove(path)
-        except ValueError:
-            pass
-
-
-def _cleanup_all():
-    with _PROFILES_LOCK:
-        paths = list(_CREATED_PROFILES)
-        _CREATED_PROFILES.clear()
-    for p in paths:
-        shutil.rmtree(p, ignore_errors=True)
-
-
-atexit.register(_cleanup_all)
-
-
-def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
-                 version_main: Optional[int], extension_path: Optional[str] = None,
-                 cf_autoclick_path: Optional[str] = None):
-    import undetected_chromedriver as uc
-
-    ext_sources = [p for p in [cf_autoclick_path, extension_path] if p and os.path.isdir(p)]
-    profile = _create_profile(worker_id, extensions=ext_sources)
-
-    opts = uc.ChromeOptions()
-    opts.page_load_strategy = "eager"
-    opts.add_argument("--no-first-run")
-    opts.add_argument("--no-default-browser-check")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--disable-infobars")
-    opts.add_argument("--lang=en-US")
-    opts.add_argument("--window-size=1280,900")
-    opts.add_argument(f"--remote-debugging-port={_free_port()}")
-    opts.add_argument("--password-store=basic")
-    opts.add_argument("--use-mock-keychain")
-
-    ext_base = os.path.join(profile, "Extensions")
-    if os.path.isdir(ext_base):
-        ext_dirs = [os.path.join(ext_base, d) for d in os.listdir(ext_base)
-                    if os.path.isdir(os.path.join(ext_base, d))]
-        if ext_dirs:
-            joined = ",".join(ext_dirs)
-            opts.add_argument(f"--load-extension={joined}")
-            opts.add_argument(f"--disable-extensions-except={joined}")
-
-    if chrome_binary:
-        opts.binary_location = chrome_binary
-
-    vendored_chromedriver = os.path.join(SCRIPT_DIR, "vendor", "ungoogled-chromium", "chromedriver")
-    driver_kwargs = dict(
-        options=opts, headless=headless, use_subprocess=True,
-        version_main=version_main, user_data_dir=profile,
-    )
-    if os.path.isfile(vendored_chromedriver):
-        driver_kwargs["driver_executable_path"] = vendored_chromedriver
-
-    driver = uc.Chrome(**driver_kwargs)
-    driver.set_page_load_timeout(30)
-    driver.set_script_timeout(60)
-    return driver, profile
-
-
-# --------------------------------------------------------------------------- #
-# Scrape logic
-# --------------------------------------------------------------------------- #
-
-def scrape_url(driver, target_url: str, selectors_json: str) -> Dict[str, Any]:
-    """Navigate to target_url and run the url-scraper workflow JS."""
-    t0 = time.time()
-    result: Dict[str, Any] = {"target_url": target_url, "status": "error"}
-
-    try:
-        try:
-            driver.get(target_url)
-        except Exception:
-            pass
-
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                if driver.execute_script("return !!document.querySelector('body')"):
-                    break
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-        time.sleep(5)
-
-        # Dismiss cookie banners
-        try:
-            driver.execute_script("""
-                var s = ["button[class*='accept']","button[class*='Accept']",
-                    "[id*='onetrust-accept']","button[id*='accept']"];
-                for (var i=0;i<s.length;i++){try{var e=document.querySelector(s[i]);if(e){e.click();break;}}catch(x){}}
-            """)
-        except Exception:
-            pass
-
-        time.sleep(2)
-        try:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-        except Exception:
-            pass
-        time.sleep(2)
-
-        scraper_js = load_workflow_js(WORKFLOW_JSON_PATH)
-        js_with_selectors = scraper_js.replace("${selectors_json}", selectors_json)
-        scraped_data_raw = driver.execute_script(f"return (function() {{ {js_with_selectors} }})()")
-
-        page_info_js = load_page_info_js(WORKFLOW_JSON_PATH)
-        page_info_raw = driver.execute_script(f"return (function() {{ {page_info_js} }})()")
-
-        result["scraped_data"] = scraped_data_raw
-        result["page_info"] = page_info_raw
-        result["final_url"] = driver.current_url
-        result["page_source"] = driver.page_source
-        result["status"] = "completed"
-
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
-    finally:
-        result["elapsed_seconds"] = round(time.time() - t0, 2)
-        result["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    return result
-
-
-# --------------------------------------------------------------------------- #
-# Browser pool
-# --------------------------------------------------------------------------- #
-
-class BrowserPool:
-    """Thread-safe pool of browser instances."""
-
-    def __init__(self, size: int, headless: bool, chrome_bin: Optional[str],
-                 version_main: Optional[int], extension_path: Optional[str],
-                 cf_autoclick_path: Optional[str]):
-        self._size = size
-        self._headless = headless
-        self._chrome_bin = chrome_bin
-        self._version_main = version_main
-        self._extension_path = extension_path
-        self._cf_autoclick_path = cf_autoclick_path
-        self._semaphore = threading.Semaphore(size)
-        self._lock = threading.Lock()
-        self._drivers: List[tuple] = []  # [(driver, profile, uses)]
-        self._next_id = 0
-
-    def _create(self) -> tuple:
-        wid = self._next_id
-        self._next_id += 1
-        driver, profile = build_driver(
-            wid, self._headless, self._chrome_bin, self._version_main,
-            self._extension_path, self._cf_autoclick_path,
+        resp = requests.post(
+            f"{EXTENSION_SERVER_URL}/workflow",
+            json=workflow,
+            timeout=timeout,
         )
-        return driver, profile, 0
+        if resp.status_code == 429:
+            return {"success": False, "error": "Queue full (429). Scraper is overloaded."}
+        if resp.status_code == 503:
+            return {"success": False, "error": "Extension not connected (503)."}
+        if resp.status_code >= 400:
+            return {"success": False, "error": f"server.py returned HTTP {resp.status_code}: {resp.text[:200]}"}
+        return resp.json()
+    except requests.Timeout:
+        return {"success": False, "error": f"Timeout after {timeout}s waiting for extension"}
+    except requests.ConnectionError:
+        return {"success": False, "error": f"Cannot connect to extension server at {EXTENSION_SERVER_URL}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-    def acquire(self) -> tuple:
-        self._semaphore.acquire()
-        with self._lock:
-            if self._drivers:
-                return self._drivers.pop()
-        return self._create()
 
-    def release(self, entry: tuple, broken: bool = False):
-        driver, profile, uses = entry
-        uses += 1
-        if broken or uses >= 50:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-            _remove_profile(profile)
+# --------------------------------------------------------------------------- #
+# Result Parsing
+# --------------------------------------------------------------------------- #
+
+def parse_extension_result(result: dict, target_url: str) -> dict:
+    """
+    Parse extension workflow result into the standard scraper API response format.
+    
+    Extension returns:
+      {"success": true, "variables": {"scraped_data": "...", "page_info": "..."}}
+    
+    We convert to:
+      {"success": true, "data": {"variables": {...}, "scraped_data": [...]}}
+    """
+    if not result.get("success"):
+        return {
+            "success": False,
+            "error": result.get("error", "Workflow failed"),
+            "data": {},
+        }
+    
+    ext_vars = result.get("variables", {})
+    
+    # Parse scraped_data from JSON string
+    scraped_data_raw = ext_vars.get("scraped_data", "[]")
+    try:
+        if isinstance(scraped_data_raw, str):
+            scraped_data = json.loads(scraped_data_raw)
         else:
-            try:
-                driver.get("about:blank")
-            except Exception:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                _remove_profile(profile)
-                self._semaphore.release()
-                return
-            with self._lock:
-                self._drivers.append((driver, profile, uses))
-        self._semaphore.release()
-
-    def shutdown(self):
-        with self._lock:
-            for driver, profile, _ in self._drivers:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                _remove_profile(profile)
-            self._drivers.clear()
+            scraped_data = scraped_data_raw
+    except (json.JSONDecodeError, TypeError):
+        scraped_data = []
+    
+    # Parse page_info
+    page_info_raw = ext_vars.get("page_info", "{}")
+    try:
+        if isinstance(page_info_raw, str):
+            page_info = json.loads(page_info_raw)
+        else:
+            page_info = page_info_raw
+    except (json.JSONDecodeError, TypeError):
+        page_info = {}
+    
+    # Build variables dict (same format as current scraper returns)
+    variables = {}
+    for item in scraped_data:
+        if isinstance(item, dict) and item.get("name"):
+            variables[item["name"]] = item.get("value")
+    
+    # Add page_html (full page source from evaluate)
+    # The extension stores page source in the evaluate result
+    page_html = ext_vars.get("page_html", "")
+    if not page_html:
+        # Construct from scraped content if available
+        content = variables.get("source_content", "")
+        if content and len(content) > 100:
+            page_html = f"<html><body>{content}</body></html>"
+    variables["page_html"] = page_html
+    
+    # Add page_info fields
+    if page_info:
+        variables["__page_title"] = page_info.get("title", "")
+        variables["__page_url"] = page_info.get("url", target_url)
+    
+    return {
+        "success": True,
+        "data": {
+            "variables": variables,
+            "scraped_data": scraped_data,
+            "page_info": page_info,
+        },
+    }
 
 
 # --------------------------------------------------------------------------- #
-# HTTP Server (Push endpoint)
+# Flask Endpoints
 # --------------------------------------------------------------------------- #
 
-def create_app(pool: BrowserPool):
-    """Create Flask app with /url-scraper-service/api/v1/scrape/ endpoint."""
-    from flask import Flask, request, jsonify
-
-    app = Flask(__name__)
-
-    @app.route("/url-scraper-service/api/v1/scrape/", methods=["POST"])
-    def scrape():
-        body = request.get_json(force=True)
+@app.route("/url-scraper-service/api/v1/scrape/", methods=["POST"])
+def scrape():
+    """
+    Main scrape endpoint — compatible with article-innovator orchestration-service.
+    
+    Request:
+      {"target_url": "https://...", "selectors": [...], "stop_on_error": false}
+    
+    Response:
+      {"success": true, "data": {"variables": {...}, "scraped_data": [...]}}
+    """
+    _stats["total_queue"] += 1
+    
+    try:
+        body = flask_request.get_json(force=True)
         target_url = body.get("target_url", "")
         selectors = body.get("selectors", [])
+        
         if not target_url:
-            return jsonify({"success": False, "error_message": "target_url required"}), 400
+            return jsonify({"success": False, "error": "target_url is required"}), 400
+        
+        # Build workflow
+        workflow = build_scrape_workflow(target_url, selectors)
+        
+        # Send to extension via server.py
+        result = send_workflow_to_extension(workflow)
+        
+        # Parse into standard format
+        response = parse_extension_result(result, target_url)
+        
+        if response["success"]:
+            _stats["total_processed"] += 1
+        else:
+            _stats["total_errors"] += 1
+        
+        return jsonify(response)
+    
+    except Exception as e:
+        _stats["total_errors"] += 1
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        _stats["total_queue"] = max(0, _stats["total_queue"] - 1)
 
-        # If no selectors provided, use defaults to extract content
-        if not selectors:
-            selectors = [
-                {"name": "source_title", "selector": "h1, title", "attribute": "text"},
-                {"name": "source_content", "selector": "article, .entry-content, .post-content, .article-body, main, #content, body", "attribute": "html"},
-                {"name": "source_author", "selector": ".author, [rel='author'], .byline, .pst-by_lnk", "attribute": "text"},
-                {"name": "source_published_date", "selector": "time[datetime], .date, .published", "attribute": "text"},
-                {"name": "source_meta_description", "selector": "meta[name='description']", "attribute": "content"},
-                {"name": "source_canonical_url", "selector": "link[rel='canonical']", "attribute": "href"},
-                {"name": "source_featured_image", "selector": "meta[property='og:image']", "attribute": "content"},
-            ]
 
-        # Build selectors_json in the format the workflow expects
-        selectors_json = json.dumps([
-            {
-                "name": s.get("name", ""),
-                "selector": s.get("selector", ""),
-                "js_query": s.get("js_query", ""),
-                "is_multiple_value": s.get("is_multiple_value", False),
-                "remove_selector": s.get("remove_selector", []),
-                "custom": s.get("custom", False),
-                "is_external_link": s.get("is_external_link", False),
-                "is_internal_link": s.get("is_internal_link", False),
-            }
-            for s in selectors
-        ])
+@app.route("/url-scraper-service/api/v1/health/", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    # Check if extension server is reachable
+    ext_status = "unknown"
+    try:
+        resp = requests.get(f"{EXTENSION_SERVER_URL}/status", timeout=3)
+        if resp.status_code == 200:
+            ext_status = "connected"
+        else:
+            ext_status = "disconnected"
+    except Exception:
+        ext_status = "unreachable"
+    
+    return jsonify({
+        "service": "url-scraper-extension",
+        "status": "healthy" if ext_status == "connected" else "degraded",
+        "architecture": "extension-based",
+        "extension_server": ext_status,
+        "extension_server_url": EXTENSION_SERVER_URL,
+        "stats": {
+            "total_processed": _stats["total_processed"],
+            "total_errors": _stats["total_errors"],
+            "total_queue": _stats["total_queue"],
+            "uptime_seconds": int(time.time() - _stats["started_at"]),
+        },
+    })
 
-        entry = pool.acquire()
-        driver, profile, uses = entry
-        broken = False
-        try:
-            result = scrape_url(driver, target_url, selectors_json)
-        except Exception as e:
-            broken = True
-            result = {"target_url": target_url, "status": "error", "error": str(e)}
-        finally:
-            pool.release((driver, profile, uses), broken=broken)
 
-        # Parse scraped_data into variables
-        variables = {}
-        scraped_data = []
-        if result.get("scraped_data"):
-            raw = result["scraped_data"]
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                scraped_data = parsed
-                for item in parsed:
-                    if isinstance(item, dict) and item.get("name"):
-                        variables[item["name"]] = item.get("value")
-
-        # Add raw page_source as page_html in scraped_data (for AI selector detection)
-        page_source = result.get("page_source", "")
-        if page_source:
-            # Truncate to 100K to keep response fast over the tunnel
-            truncated_source = page_source[:100000] if len(page_source) > 100000 else page_source
-            scraped_data.insert(0, {"name": "page_html", "selector": "html", "value": truncated_source})
-            variables["page_html"] = truncated_source
-
-        if result.get("page_info"):
-            raw = result["page_info"]
-            info = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(info, dict):
-                variables["__page_title"] = info.get("title", "")
-                variables["__page_url"] = info.get("url", "")
-
-        return jsonify({
-            "success": True,
-            "data": {
-                "target_url": target_url,
-                "final_url": result.get("final_url", target_url),
-                "http_status": 200,
-                "elapsed_ms": int(result.get("elapsed_seconds", 0) * 1000),
-                "variables": variables,
-                "scraped_data": scraped_data,
-                "screenshot_b64": None,
-                "detected_selectors": [],
-            },
-            "message": "Scrape completed",
-        })
-
-    @app.route("/url-scraper-service/api/v1/health/", methods=["GET"])
-    @app.route("/health/", methods=["GET"])
-    def health():
-        return jsonify({"status": "healthy", "service": "url-scraper-local"})
-
-    @app.route("/", methods=["GET"])
-    def root():
-        return jsonify({
-            "service": "url-scraper-local",
-            "version": "1.0.0",
-            "docs": "POST /url-scraper-service/api/v1/scrape/",
-        })
-
-    return app
+@app.route("/url-scraper-service/api/v1/metrics/", methods=["GET"])
+def metrics():
+    """Prometheus-style metrics."""
+    return jsonify({
+        "scraper_requests_total": _stats["total_processed"] + _stats["total_errors"],
+        "scraper_success_total": _stats["total_processed"],
+        "scraper_errors_total": _stats["total_errors"],
+        "scraper_queue_current": _stats["total_queue"],
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -455,64 +292,25 @@ def create_app(pool: BrowserPool):
 # --------------------------------------------------------------------------- #
 
 def main():
-    p = argparse.ArgumentParser(
-        description="URL Scraper — Push-based local worker. Runs an HTTP server "
-                    "that accepts scrape requests (same API as url-scraper-service).",
-    )
-    p.add_argument("--port", type=int, default=8814)
-    p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--workers", type=int, default=3, help="Browser pool size")
-    p.add_argument("--chrome", help="Path to chrome/chromium binary")
-    p.add_argument("--extension", help="Path to real-botxbyte-extension folder")
-    args = p.parse_args()
-
-    # Signal handlers
-    def _handler(signum, _frame):
-        _cleanup_all()
-        sys.exit(128 + signum)
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        try:
-            signal.signal(sig, _handler)
-        except (ValueError, OSError):
-            pass
-
-    # Resolve extensions
-    extension_path: Optional[str] = None
-    if args.extension:
-        extension_path = os.path.abspath(os.path.expanduser(args.extension))
-    else:
-        vendored = os.path.join(SCRIPT_DIR, "vendor", "real-botxbyte-extension")
-        if os.path.isfile(os.path.join(vendored, "manifest.json")):
-            extension_path = vendored
-
-    cf_autoclick_path: Optional[str] = None
-    vendored_cf = os.path.join(SCRIPT_DIR, "vendor", "cf-autoclick")
-    if os.path.isfile(os.path.join(vendored_cf, "manifest.json")):
-        cf_autoclick_path = vendored_cf
-
-    chrome_bin = args.chrome or find_chrome_binary()
-    version_main = detect_chrome_major(chrome_bin)
-
-    print(f"[*] URL Scraper - Push-based Local Worker (HTTP Server)")
-    print(f"[*] Listening: http://{args.host}:{args.port}")
-    print(f"[*] Endpoint: POST /url-scraper-service/api/v1/scrape/")
-    print(f"[*] Chrome: {chrome_bin}")
-    print(f"[*] CF-Autoclick: {cf_autoclick_path or 'none'}")
-    print(f"[*] Extension: {extension_path or 'none'}")
-    print(f"[*] Pool size: {args.workers}")
-    print(f"[*] Workflow: {WORKFLOW_JSON_PATH}")
+    parser = argparse.ArgumentParser(description="URL Scraper (Extension-based)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to listen on")
+    parser.add_argument("--extension-server", type=str, default=EXTENSION_SERVER_URL, 
+                        help="Extension server.py URL")
+    parser.add_argument("--timeout", type=int, default=REQUEST_TIMEOUT,
+                        help="Timeout for scrape requests (seconds)")
+    args = parser.parse_args()
+    
+    global EXTENSION_SERVER_URL, REQUEST_TIMEOUT
+    EXTENSION_SERVER_URL = args.extension_server
+    REQUEST_TIMEOUT = args.timeout
+    
+    print(f"🚀 URL Scraper (Extension-based) starting on port {args.port}")
+    print(f"   Extension server: {EXTENSION_SERVER_URL}")
+    print(f"   Timeout: {REQUEST_TIMEOUT}s")
+    print(f"   Workflow template: {WORKFLOW_TEMPLATE_PATH}")
     print()
-
-    pool = BrowserPool(
-        size=args.workers, headless=args.headless, chrome_bin=chrome_bin,
-        version_main=version_main, extension_path=extension_path,
-        cf_autoclick_path=cf_autoclick_path,
-    )
-    atexit.register(pool.shutdown)
-
-    app = create_app(pool)
-    app.run(host=args.host, port=args.port, threaded=True)
+    
+    app.run(host="0.0.0.0", port=args.port, threaded=True)
 
 
 if __name__ == "__main__":
