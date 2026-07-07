@@ -1,0 +1,140 @@
+name: URL Scraper VNC
+
+on:
+  workflow_dispatch:
+
+env:
+  DISPLAY: ":1"
+  SCRAPER_DIR: "/home/runner/url-scraper-local"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Clone scraper code
+        run: |
+          git clone --depth 1 https://github.com/domain-metrcis/url-scraper-local-2.git url-scraper-local
+          mv url-scraper-local "$SCRAPER_DIR"
+          ls "$SCRAPER_DIR"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system deps + Xvfb
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk-bridge2.0-0 libxkbcommon0 libxcomposite1 \
+            libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+            libasound2t64 libxshmfence1 fonts-liberation xfonts-base
+          echo "✅ System deps installed"
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :1 -screen 0 1920x1080x24 &
+          sleep 2
+          echo "✅ Xvfb started on :1"
+
+      - name: Install Python deps
+        run: |
+          pip install flask websocket-client requests
+          echo "✅ Python deps installed"
+
+      - name: Download ungoogled-chromium
+        run: |
+          cd "$SCRAPER_DIR"
+          mkdir -p vendor
+          CHROMIUM_VERSION="149.0.7827.53-1"
+          CHROMIUM_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux.tar.xz"
+          echo "Downloading ungoogled-chromium..."
+          curl -fL -o /tmp/chromium.tar.xz "$CHROMIUM_URL"
+          tar -xJf /tmp/chromium.tar.xz -C vendor/
+          mv vendor/ungoogled-chromium-* vendor/ungoogled-chromium
+          chmod +x vendor/ungoogled-chromium/chrome
+          vendor/ungoogled-chromium/chrome --version
+          echo "✅ Chromium ready"
+
+      - name: Download cf-autoclick extension
+        run: |
+          cd "$SCRAPER_DIR"
+          git clone --depth 1 https://github.com/tenacious6/cf-autoclick.git vendor/cf-autoclick
+          test -f vendor/cf-autoclick/manifest.json
+          echo "✅ cf-autoclick extension ready"
+
+      - name: Install cloudflared
+        run: |
+          wget -q -O /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          echo "✅ cloudflared installed"
+
+      - name: Start Cloudflare Tunnel
+        id: tunnel
+        run: |
+          cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/tunnel.log 2>&1 &
+          TUNNEL_URL=""
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Tunnel failed"; cat /tmp/tunnel.log; exit 1
+          fi
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+          echo "✅ Tunnel: $TUNNEL_URL"
+
+      - name: Start scraper
+        run: |
+          cd "$SCRAPER_DIR"
+          nohup python3 scraper.py \
+            --port 8814 \
+            --chrome "$SCRAPER_DIR/vendor/ungoogled-chromium/chrome" \
+            --extension "$SCRAPER_DIR/vendor/cf-autoclick" \
+            --max-concurrent 3 \
+            --timeout 60 \
+            > /tmp/scraper.log 2>&1 &
+          sleep 3
+          if curl -s http://localhost:8814/url-scraper-service/api/v1/health/ | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='healthy'"; then
+            echo "✅ Scraper running"
+          else
+            echo "❌ Scraper failed"; cat /tmp/scraper.log; exit 1
+          fi
+
+      - name: Test scrape
+        run: |
+          RESULT=$(curl -s --max-time 60 -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
+            -H "Content-Type: application/json" \
+            -d '{"target_url": "https://example.com", "selectors": []}')
+          echo "$RESULT" | python3 -c "
+          import sys,json
+          d = json.load(sys.stdin)
+          assert d['success'], f'Scrape failed: {d.get(\"error\")}'
+          print('✅ Scrape test passed')
+          "
+
+      - name: Print info
+        run: |
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  SCRAPER READY"
+          echo "  URL: ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "  Architecture: fresh chrome per request"
+          echo "  Concurrency: 3"
+          echo "════════════════════════════════════════"
+
+      - name: Keep alive (6 hours)
+        run: |
+          echo "Running for 6 hours..."
+          echo "Tunnel: ${{ steps.tunnel.outputs.tunnel_url }}"
+          for i in $(seq 1 2160); do
+            sleep 10
+            if ! curl -s -o /dev/null http://localhost:8814/url-scraper-service/api/v1/health/; then
+              echo "[$(date)] ⚠️ Health check failed"
+              tail -5 /tmp/scraper.log
+            fi
+          done
