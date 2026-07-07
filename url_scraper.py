@@ -133,14 +133,43 @@ def scrape_with_fresh_chrome(target_url: str, selectors: List[Dict[str, Any]]) -
         server_env["DISPLAY"] = DISPLAY
 
         server_script = EXTENSION_DIR / "server.py"
+        
+        # Create a wrapper that patches missing imports before running server.py
+        wrapper_code = f"""
+import sys, types
+# Patch faster_whisper if not installed (optional dep for audio captcha)
+try:
+    import faster_whisper
+except ImportError:
+    mod = types.ModuleType('faster_whisper')
+    mod.WhisperModel = lambda *a, **kw: None
+    sys.modules['faster_whisper'] = mod
+# Patch boto3 if not installed
+try:
+    import boto3
+except ImportError:
+    mod = types.ModuleType('boto3')
+    mod.client = lambda *a, **kw: None
+    sys.modules['boto3'] = mod
+# Now run server.py
+exec(open('{server_script}').read())
+"""
+        wrapper_file = Path(profile_dir) / "_server_wrapper.py"
+        wrapper_file.write_text(wrapper_code)
+        
         server_proc = subprocess.Popen(
-            [sys.executable, str(server_script)],
+            [sys.executable, str(wrapper_file)],
             env=server_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(EXTENSION_DIR),
         )
-        time.sleep(2)  # Let server.py start
+        time.sleep(3)  # Let server.py start
+
+        # Check if server.py crashed on startup
+        if server_proc.poll() is not None:
+            output = server_proc.stdout.read().decode(errors="replace")[:500]
+            return {"success": False, "error": f"server.py crashed on startup: {output}"}
 
         # 3. Launch fresh chromium with extensions
         chrome_args = [
