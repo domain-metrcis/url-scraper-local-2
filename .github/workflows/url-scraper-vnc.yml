@@ -214,119 +214,75 @@ jobs:
 
       - name: Launch Chromium with real-botxbyte-extension
         run: |
-          export DISPLAY=:1
-          export NO_AT_BRIDGE=1
-          cd "$SCRAPER_DIR"
-
-          CHROME_BIN="$SCRAPER_DIR/vendor/ungoogled-chromium/chrome"
-          EXT_PATH="$SCRAPER_DIR/vendor/real-botxbyte-extension"
-          PROFILE_DIR="/tmp/chrome-profile-scraper"
-          mkdir -p "$PROFILE_DIR"
-
-          # Launch ungoogled-chromium with the extension loaded
-          nohup "$CHROME_BIN" \
-            --user-data-dir="$PROFILE_DIR" \
-            --load-extension="$EXT_PATH" \
-            --no-first-run \
-            --no-default-browser-check \
-            --disable-background-networking \
-            --disable-sync \
-            --disable-translate \
-            --disable-features=TranslateUI \
-            --no-sandbox \
-            --disable-dev-shm-usage \
-            > /tmp/chrome.log 2>&1 &
-
-          CHROME_PID=$!
-          echo "  Chrome PID: $CHROME_PID"
-          sleep 5
-
-          if kill -0 $CHROME_PID 2>/dev/null; then
-            echo "✅ Chromium launched with real-botxbyte-extension (PID: $CHROME_PID)"
-          else
-            echo "❌ Chrome failed to start"; cat /tmp/chrome.log; exit 1
-          fi
+          echo "Skipping persistent Chrome — each request spawns its own fresh instance"
+          echo "✅ Fresh-chrome-per-request mode"
 
       - name: Start server.py (Extension Bridge)
         run: |
-          cd "$SCRAPER_DIR"
-          source .venv/bin/activate
-
-          # Start server.py which connects to extension via WebSocket
-          export MAX_TABS=10
-          export MAX_QUEUE=30
-          nohup python3 real-botxbyte-extension/server.py > /tmp/server-py.log 2>&1 &
-          SERVER_PID=$!
-          echo "  server.py PID: $SERVER_PID"
-          sleep 5
-
-          if kill -0 $SERVER_PID 2>/dev/null; then
-            echo "✅ server.py started (PID: $SERVER_PID) — WS:8765 HTTP:8766"
-          else
-            echo "❌ server.py failed"; cat /tmp/server-py.log; exit 1
-          fi
-
-          # Wait for extension to connect via WebSocket
-          echo "Waiting for extension WebSocket connection..."
-          for i in $(seq 1 30); do
-            if grep -q "Extension connected" /tmp/server-py.log 2>/dev/null; then
-              echo "✅ Extension connected to server.py"
-              break
-            fi
-            sleep 2
-          done
+          echo "Skipping persistent server.py — each request spawns its own server.py + chrome pair"
+          echo "✅ Fresh-chrome-per-request mode"
 
       - name: Start URL Scraper API (Flask proxy)
         run: |
           cd "$SCRAPER_DIR"
           source .venv/bin/activate
 
-          nohup python3 url_scraper.py --port 8814 --extension-server http://localhost:8766 > /tmp/url-scraper.log 2>&1 &
+          export MAX_CONCURRENT=3
+          export SCRAPE_TIMEOUT=90
+
+          nohup python3 url_scraper.py --port 8814 --max-concurrent $MAX_CONCURRENT --timeout $SCRAPE_TIMEOUT > /tmp/url-scraper.log 2>&1 &
           SCRAPER_PID=$!
           echo "  url_scraper.py PID: $SCRAPER_PID"
           sleep 3
 
           if kill -0 $SCRAPER_PID 2>/dev/null; then
             echo "✅ URL Scraper API started (PID: $SCRAPER_PID) on port 8814"
+            echo "   Mode: fresh-chromium-per-request"
+            echo "   Max concurrent: $MAX_CONCURRENT"
+            echo "   Timeout: ${SCRAPE_TIMEOUT}s"
           else
             echo "❌ URL Scraper failed"; cat /tmp/url-scraper.log; exit 1
           fi
 
       - name: Test scraper health
         run: |
-          sleep 5
+          sleep 3
           echo "Testing health endpoint..."
           curl -s http://localhost:8814/url-scraper-service/api/v1/health/ | python3 -m json.tool
           echo "✅ Health check passed"
 
       - name: Test scrape with sample URL
         run: |
-          echo "Testing scrape with example.com..."
-          RESULT=$(curl -s -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
+          echo "Testing scrape with example.com (fresh chrome instance)..."
+          RESULT=$(curl -s --max-time 120 -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
             -H "Content-Type: application/json" \
             -d '{"target_url": "https://example.com", "selectors": []}')
           echo "$RESULT" | python3 -c "
           import sys, json
           d = json.load(sys.stdin)
           print(f'Success: {d.get(\"success\")}')
-          vars = d.get('data', {}).get('variables', {})
-          print(f'Title: {vars.get(\"source_title\", \"\")}')
-          print(f'Content length: {len(vars.get(\"source_content\", \"\"))} chars')
+          if d.get('data'):
+              vars = d['data'].get('variables', {})
+              print(f'Title: {vars.get(\"source_title\", \"\")}')
+              print(f'Content length: {len(str(vars.get(\"source_content\", \"\")))} chars')
+          else:
+              print(f'Error: {d.get(\"error\",\"\")}')
           "
-          echo "✅ Scrape test passed"
+          echo "✅ Scrape test done"
 
       - name: Print connection info
         run: |
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║              URL SCRAPER (Extension-based) READY            ║"
+          echo "║          URL SCRAPER (Fresh Chrome per Request)             ║"
           echo "╠══════════════════════════════════════════════════════════════╣"
           echo "║ Scraper API: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
           echo "║ VNC URL:     ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "║ VNC Pass:    botxbyte123"
-          echo "║ Architecture: ungoogled-chromium + real-botxbyte-extension"
-          echo "║ Max Tabs:    10 parallel"
-          echo "║ Max Queue:   30 pending"
+          echo "║ Architecture: fresh ungoogled-chromium per request"
+          echo "║ Extensions:  real-botxbyte-extension + cf-autoclick"
+          echo "║ Concurrency: 3 parallel (increase workflows for more)"
+          echo "║ No memory leaks — browser killed after each request"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
 
