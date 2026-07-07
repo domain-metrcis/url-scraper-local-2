@@ -1,6 +1,0 @@
-ai-management-service.code-workspace/
-seq-data/
-docker-compose.yaml
-# graphify knowledge graph output (local-only)
-graphify-out/
-.graphify/

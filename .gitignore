@@ -1,9 +1,4 @@
-# Virtual environment
 .venv/
-
-# Python cache
 __pycache__/
 *.pyc
-
-# Vendor (symlinks to local binaries)
 vendor/

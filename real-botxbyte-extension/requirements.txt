@@ -1,5 +1,0 @@
-aiohttp
-websockets
-boto3
-faster-whisper
-pyautogui
