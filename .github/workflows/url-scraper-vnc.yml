@@ -210,7 +210,9 @@ jobs:
           cd "$SCRAPER_DIR"
           python3 -m venv .venv
           source .venv/bin/activate
-          pip install --no-cache-dir flask requests aiohttp websockets boto3 faster-whisper
+          pip install --no-cache-dir flask requests aiohttp websockets boto3
+          # faster-whisper needed by server.py for audio captcha (will download model on first use)
+          pip install --no-cache-dir faster-whisper || echo "⚠️ faster-whisper failed — audio captcha won't work"
 
       - name: Launch Chromium with real-botxbyte-extension
         run: |
@@ -305,14 +307,12 @@ jobs:
               
               if [ $FAILURES -ge 3 ]; then
                 echo "❌ 3 consecutive health failures. Checking components..."
-                echo "--- Chrome ---"
-                pgrep -a chrome | head -3 || echo "Chrome not running!"
-                echo "--- server.py ---"
-                pgrep -af server.py || echo "server.py not running!"
                 echo "--- url_scraper.py ---"
                 pgrep -af url_scraper.py || echo "url_scraper.py not running!"
-                echo "--- server.py log (last 10) ---"
-                tail -10 /tmp/server-py.log
+                echo "--- url_scraper.py log (last 10) ---"
+                tail -10 /tmp/url-scraper.log 2>/dev/null || true
+                echo "--- Active chrome processes ---"
+                pgrep -ac chrome || echo "0"
                 FAILURES=0
               fi
             else
