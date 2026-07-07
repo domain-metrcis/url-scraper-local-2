@@ -24,9 +24,10 @@ jobs:
       - name: Move code to expected directory
         run: |
           rm -rf "$SCRAPER_DIR"
-          mv url-scraper-local "$SCRAPER_DIR"
+          mv "$GITHUB_WORKSPACE/url-scraper-local" "$SCRAPER_DIR"
           echo "✅ url-scraper-local ready at $SCRAPER_DIR"
-          ls -la "$SCRAPER_DIR"
+          ls "$SCRAPER_DIR/tools/" || echo "⚠️ tools/ not found after move!"
+          ls "$SCRAPER_DIR/real-botxbyte-extension/" || echo "⚠️ real-botxbyte-extension/ not found!"
 
       - name: Set up Python
         uses: actions/setup-python@v5
