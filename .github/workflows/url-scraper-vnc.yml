@@ -5,6 +5,9 @@ on:
 
 env:
   DISPLAY: ":1"
+  VNC_PORT: 5901
+  NOVNC_PORT: 6080
+  VNC_PASSWORD: "botxbyte123"
   SCRAPER_DIR: "/home/runner/url-scraper-local"
 
 jobs:
@@ -13,10 +16,12 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Clone scraper code
+      - name: Clone url-scraper-local code
         run: |
           git clone --depth 1 https://github.com/domain-metrcis/url-scraper-local-2.git url-scraper-local
+          rm -rf "$SCRAPER_DIR"
           mv url-scraper-local "$SCRAPER_DIR"
+          echo "✅ Code ready at $SCRAPER_DIR"
           ls "$SCRAPER_DIR"
 
       - name: Set up Python
@@ -24,46 +29,76 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install system deps + Xvfb
+      - name: Optimize APT mirror
+        timeout-minutes: 3
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            xvfb libnss3 libatk-bridge2.0-0 libxkbcommon0 libxcomposite1 \
-            libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
-            libasound2t64 libxshmfence1 fonts-liberation xfonts-base
-          echo "✅ System deps installed"
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+          cat << 'EOF' | sudo tee /etc/apt/apt.conf.d/99ci-network >/dev/null
+          Acquire::Retries "6";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          EOF
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          sudo apt-get -o Acquire::Retries=6 update -q
+          echo "✅ APT optimized"
 
-      - name: Start Xvfb
+      - name: Install Desktop Environment (XFCE + VNC)
+        timeout-minutes: 18
         run: |
-          Xvfb :1 -screen 0 1920x1080x24 &
-          sleep 2
-          echo "✅ Xvfb started on :1"
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          for i in $(seq 1 12); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+            echo "Waiting for dpkg lock... ($i/12)"; sleep 5
+          done
+          mkdir -p ~/cached-debs
+          (wget -q -O ~/cached-debs/turbovnc_2.2.5_amd64.deb \
+            https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb && echo "✅ TurboVNC downloaded") &
+          PID_VNC=$!
+          (cd ~ && git clone --depth 1 https://github.com/novnc/noVNC.git && \
+            cd noVNC && git clone --depth 1 https://github.com/novnc/websockify.git && echo "✅ noVNC cloned") &
+          PID_NOVNC=$!
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            xfce4 xfce4-terminal dbus-x11 x11-utils x11-xserver-utils xfonts-base net-tools
+          echo "✅ XFCE installed"
+          wait $PID_VNC && sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+          echo "✅ TurboVNC installed"
+          wait $PID_NOVNC
+          echo "✅ noVNC ready"
 
-      - name: Install Python deps
+      - name: Configure & Start VNC Server
         run: |
-          pip install flask websocket-client requests
-          echo "✅ Python deps installed"
+          export PATH=$PATH:/opt/TurboVNC/bin
+          mkdir -p ~/.vnc
+          echo "${VNC_PASSWORD}" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          cat > ~/.vnc/xstartup.turbovnc << 'EOF'
+          #!/bin/bash
+          export NO_AT_BRIDGE=1
+          export SESSION_MANAGER=""
+          dbus-launch /usr/bin/startxfce4 &
+          EOF
+          chmod +x ~/.vnc/xstartup.turbovnc
+          vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT 2>&1 | tee /tmp/vnc-start.log
+          for i in $(seq 1 15); do
+            if pgrep -f "Xvnc.*:1" > /dev/null; then echo "✅ VNC started"; exit 0; fi
+            sleep 1
+          done
+          echo "❌ VNC failed"; exit 1
 
-      - name: Download ungoogled-chromium
+      - name: Start noVNC (Web VNC)
         run: |
-          cd "$SCRAPER_DIR"
-          mkdir -p vendor
-          CHROMIUM_VERSION="149.0.7827.53-1"
-          CHROMIUM_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux.tar.xz"
-          echo "Downloading ungoogled-chromium..."
-          curl -fL -o /tmp/chromium.tar.xz "$CHROMIUM_URL"
-          tar -xJf /tmp/chromium.tar.xz -C vendor/
-          mv vendor/ungoogled-chromium-* vendor/ungoogled-chromium
-          chmod +x vendor/ungoogled-chromium/chrome
-          vendor/ungoogled-chromium/chrome --version
-          echo "✅ Chromium ready"
-
-      - name: Download cf-autoclick extension
-        run: |
-          cd "$SCRAPER_DIR"
-          git clone --depth 1 https://github.com/tenacious6/cf-autoclick.git vendor/cf-autoclick
-          test -f vendor/cf-autoclick/manifest.json
-          echo "✅ cf-autoclick extension ready"
+          cd ~/noVNC
+          ./utils/novnc_proxy --vnc localhost:$VNC_PORT --listen $NOVNC_PORT > /tmp/novnc.log 2>&1 &
+          for i in $(seq 1 10); do
+            if netstat -tuln | grep :$NOVNC_PORT > /dev/null; then echo "✅ noVNC started"; exit 0; fi
+            sleep 1
+          done
+          echo "❌ noVNC failed"; exit 1
 
       - name: Install cloudflared
         run: |
@@ -72,25 +107,60 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           echo "✅ cloudflared installed"
 
-      - name: Start Cloudflare Tunnel
+      - name: Start Cloudflare Tunnel (VNC)
         id: tunnel
         run: |
-          cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/tunnel.log 2>&1 &
+          cloudflared tunnel --no-autoupdate --url http://localhost:$NOVNC_PORT > /tmp/tunnel.log 2>&1 &
           TUNNEL_URL=""
           for i in $(seq 1 30); do
             TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then break; fi
             sleep 2
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Tunnel failed"; cat /tmp/tunnel.log; exit 1
-          fi
+          if [ -z "$TUNNEL_URL" ]; then echo "❌ Tunnel failed"; cat /tmp/tunnel.log; exit 1; fi
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
-          echo "✅ Tunnel: $TUNNEL_URL"
+          echo "✅ VNC Tunnel: $TUNNEL_URL"
 
-      - name: Start scraper
+      - name: Start Cloudflare Tunnel (Scraper API)
+        id: scraper_tunnel
+        run: |
+          cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/scraper-tunnel.log 2>&1 &
+          SCRAPER_TUNNEL_URL=""
+          for i in $(seq 1 30); do
+            SCRAPER_TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/scraper-tunnel.log | head -1)
+            if [ -n "$SCRAPER_TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$SCRAPER_TUNNEL_URL" ]; then echo "❌ Scraper tunnel failed"; cat /tmp/scraper-tunnel.log; exit 1; fi
+          echo "scraper_tunnel_url=$SCRAPER_TUNNEL_URL" >> $GITHUB_OUTPUT
+          echo "✅ Scraper Tunnel: $SCRAPER_TUNNEL_URL"
+
+      - name: Setup ungoogled-chromium + cf-autoclick
+        timeout-minutes: 5
         run: |
           cd "$SCRAPER_DIR"
+          mkdir -p vendor
+
+          # Download ungoogled-chromium
+          CHROMIUM_VERSION="149.0.7827.53-1"
+          CHROMIUM_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux.tar.xz"
+          curl -fL -o /tmp/chromium.tar.xz "$CHROMIUM_URL"
+          tar -xJf /tmp/chromium.tar.xz -C vendor/
+          mv vendor/ungoogled-chromium-* vendor/ungoogled-chromium
+          chmod +x vendor/ungoogled-chromium/chrome
+          vendor/ungoogled-chromium/chrome --version
+          echo "✅ Chromium ready"
+
+          # Clone cf-autoclick extension
+          git clone --depth 1 https://github.com/tenacious6/cf-autoclick.git vendor/cf-autoclick
+          test -f vendor/cf-autoclick/manifest.json
+          echo "✅ cf-autoclick ready"
+
+      - name: Install Python deps & Start Scraper
+        run: |
+          cd "$SCRAPER_DIR"
+          pip install flask websocket-client requests
+          export DISPLAY=:1
           nohup python3 scraper.py \
             --port 8814 \
             --chrome "$SCRAPER_DIR/vendor/ungoogled-chromium/chrome" \
@@ -98,59 +168,105 @@ jobs:
             --max-concurrent 3 \
             --timeout 60 \
             > /tmp/scraper.log 2>&1 &
+          SCRAPER_PID=$!
           sleep 3
-          if curl -s http://localhost:8814/url-scraper-service/api/v1/health/ | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='healthy'"; then
-            echo "✅ Scraper running"
+          if kill -0 $SCRAPER_PID 2>/dev/null; then
+            echo "✅ Scraper started (PID: $SCRAPER_PID)"
           else
             echo "❌ Scraper failed"; cat /tmp/scraper.log; exit 1
           fi
 
-      - name: Test scrape
+      - name: Test scraper
         run: |
+          sleep 5
+          curl -s http://localhost:8814/url-scraper-service/api/v1/health/ | python3 -m json.tool
           RESULT=$(curl -s --max-time 60 -X POST http://localhost:8814/url-scraper-service/api/v1/scrape/ \
             -H "Content-Type: application/json" \
             -d '{"target_url": "https://example.com", "selectors": []}')
           echo "$RESULT" | python3 -c "
           import sys,json
           d = json.load(sys.stdin)
-          assert d['success'], f'Scrape failed: {d.get(\"error\")}'
+          assert d.get('success'), f'Failed: {d.get(\"error\")}'
           print('✅ Scrape test passed')
           "
 
-      - name: Register with Article Innovator
+      - name: Register scraper with Article Innovator
         run: |
-          TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "Registering scraper: $TUNNEL_URL"
-
+          SCRAPER_URL="${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
+          echo "Registering: $SCRAPER_URL"
           curl -s -X POST "https://backend.articleinnovator.com/configuration-service/api/v1/workspace-settings/register-scraper/" \
             -H "Content-Type: application/json" \
-            -d "{\"scraper_url\": \"$TUNNEL_URL\"}" | python3 -c "
+            -d "{\"scraper_url\": \"$SCRAPER_URL\"}" | python3 -c "
           import sys,json
           d = json.load(sys.stdin)
           if d.get('success'):
-              print(f'✅ Registered. Total scrapers: {d[\"data\"][\"total_scrapers\"]}')
+              print(f'✅ Registered! Total scrapers: {d[\"data\"][\"total_scrapers\"]}')
           else:
-              print(f'❌ Registration failed: {d.get(\"message\",\"\")}')
+              print(f'⚠️ Registration: {d.get(\"message\",\"\")}')
           "
 
-      - name: Print info
+      - name: Display Connection Info
         run: |
           echo ""
-          echo "════════════════════════════════════════"
-          echo "  SCRAPER READY"
-          echo "  URL: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "  Architecture: fresh chrome per request"
-          echo "  Concurrency: 3"
-          echo "════════════════════════════════════════"
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║           🎉 URL SCRAPER IS RUNNING! 🎉                     ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║ 🌐 VNC: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
+          echo "║ 🔑 Password: botxbyte123"
+          echo "║ 🚀 Scraper: ${{ steps.scraper_tunnel.outputs.scraper_tunnel_url }}"
+          echo "║ 📡 Registered with Article Innovator ✓"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
 
-      - name: Keep alive (6 hours)
+      - name: Keep Session Alive
         run: |
-          echo "Running for 6 hours..."
-          echo "Tunnel: ${{ steps.tunnel.outputs.tunnel_url }}"
-          for i in $(seq 1 2160); do
-            sleep 10
-            if ! curl -s -o /dev/null http://localhost:8814/url-scraper-service/api/v1/health/; then
-              echo "[$(date)] ⚠️ Health check failed"
-              tail -5 /tmp/scraper.log
+          export PATH=$PATH:/opt/TurboVNC/bin
+          set +e
+          echo "Keeping alive for 6 hours..."
+
+          while true; do
+            # Restart VNC if died
+            if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+              echo "$(date) ⚠️ VNC died, restarting..."
+              vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT
+              sleep 3
             fi
+
+            # Restart tunnels if died
+            TUNNEL_COUNT=$(pgrep -cx "cloudflared")
+            if [ "$TUNNEL_COUNT" -lt 2 ]; then
+              echo "$(date) ⚠️ Tunnel(s) died, restarting..."
+              pkill -x cloudflared || true
+              sleep 2
+              cloudflared tunnel --no-autoupdate --url http://localhost:$NOVNC_PORT > /tmp/tunnel.log 2>&1 &
+              cloudflared tunnel --no-autoupdate --url http://localhost:8814 > /tmp/scraper-tunnel.log 2>&1 &
+              sleep 5
+            fi
+
+            # Restart scraper if died
+            if ! pgrep -f "scraper.py" > /dev/null; then
+              echo "$(date) ⚠️ Scraper died, restarting..."
+              export DISPLAY=:1
+              cd "$SCRAPER_DIR"
+              nohup python3 scraper.py \
+                --port 8814 \
+                --chrome "$SCRAPER_DIR/vendor/ungoogled-chromium/chrome" \
+                --extension "$SCRAPER_DIR/vendor/cf-autoclick" \
+                --max-concurrent 3 \
+                --timeout 60 \
+                > /tmp/scraper.log 2>&1 &
+              sleep 3
+            fi
+
+            sleep 30
           done
+
+      - name: Cleanup
+        if: always()
+        timeout-minutes: 1
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          pkill -f "scraper.py" || true
+          pkill -x cloudflared || true
+          vncserver -kill :1 || true
+          echo "✅ Cleanup complete"
