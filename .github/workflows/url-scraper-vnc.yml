@@ -265,28 +265,40 @@ jobs:
         if: always()
         timeout-minutes: 1
         run: |
-          # Get the scraper tunnel URL from the tunnel log
-          SCRAPER_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/scraper-tunnel.log | head -1)
-          if [ -n "$SCRAPER_URL" ]; then
-            echo "Deregistering scraper: $SCRAPER_URL"
-            RESP=$(curl -s --max-time 10 -X POST \
-              "https://backend.articleinnovator.com/configuration-service/api/v1/workspace-settings/deregister-scraper/" \
-              -H "Content-Type: application/json" \
-              -d "{\"scraper_url\": \"$SCRAPER_URL\"}" 2>/dev/null || echo '{"success":false}')
-            echo "$RESP" | python3 -c "
+          DEREGISTER_URL="https://backend.articleinnovator.com/configuration-service/api/v1/workspace-settings/deregister-scraper/"
+
+          # Collect ALL unique trycloudflare URLs from scraper tunnel log (handles restarts)
+          URLS=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/scraper-tunnel.log 2>/dev/null | sort -u)
+
+          if [ -z "$URLS" ]; then
+            echo "⚠️ No scraper tunnel URLs found in log"
+          else
+            echo "$URLS" | while read -r SCRAPER_URL; do
+              echo "Deregistering: $SCRAPER_URL"
+              curl -s --max-time 10 -X POST "$DEREGISTER_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"scraper_url\": \"$SCRAPER_URL\"}" 2>/dev/null \
+                | python3 -c "
           import sys,json
           try:
-              d = json.load(sys.stdin)
-              if d.get('success'):
-                  print(f'✅ Deregistered! Remaining scrapers: {d.get(\"data\",{}).get(\"total_scrapers\",\"?\") }')
-              else:
-                  print(f'⚠️ Deregister response: {d.get(\"message\", d.get(\"error\",\"\"))}')
+              d=json.load(sys.stdin)
+              print(f'  ✅ Done' if d.get('success') else f'  ⚠️ {d.get(\"message\",\"\")}')
           except:
-              print('⚠️ Could not parse deregister response')
+              print('  ⚠️ No response')
           " || true
-          else
-            echo "⚠️ No scraper tunnel URL found to deregister"
+            done
           fi
+
+          # Also deregister from the legacy endpoint (article-management-service)
+          if [ -n "$URLS" ]; then
+            echo "$URLS" | while read -r SCRAPER_URL; do
+              curl -s --max-time 10 -X POST \
+                "https://backend.articleinnovator.com/article-management-service/api/v1/scraper-registry/deregister/" \
+                -H "Content-Type: application/json" \
+                -d "{\"scraper_url\": \"$SCRAPER_URL\"}" 2>/dev/null || true
+            done
+          fi
+          echo "✅ Deregistration complete"
 
       - name: Cleanup
         if: always()
