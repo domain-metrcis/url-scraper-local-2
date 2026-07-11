@@ -294,6 +294,166 @@ def scrape_url(target_url: str, selectors: list) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Core: screenshot with fresh chrome via CDP
+# --------------------------------------------------------------------------- #
+
+def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, height: int = 1080, wait: int = 5) -> dict:
+    """Launch chrome, navigate, take screenshot, kill. Returns base64 PNG."""
+    
+    profile_dir = tempfile.mkdtemp(prefix="screenshot_")
+    cdp_port = _free_port()
+    chrome_proc = None
+    
+    try:
+        # 1. Launch chrome
+        chrome_args = [
+            CHROME_BIN,
+            f"--user-data-dir={profile_dir}",
+            f"--remote-debugging-port={cdp_port}",
+            "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            f"--window-size={width},{height}",
+        ]
+        
+        # Add cf-autoclick extension if exists
+        if os.path.isdir(CF_AUTOCLICK_DIR):
+            chrome_args.append(f"--load-extension={CF_AUTOCLICK_DIR}")
+        else:
+            chrome_args.append("--headless=new")
+        
+        env = os.environ.copy()
+        env["DISPLAY"] = DISPLAY
+        
+        chrome_proc = subprocess.Popen(
+            chrome_args, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        
+        # 2. Wait for CDP
+        cdp_base = f"http://127.0.0.1:{cdp_port}"
+        ready = False
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                r = http_requests.get(f"{cdp_base}/json/version", timeout=2)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+        
+        if not ready:
+            return {"success": False, "error": "Chrome CDP not ready after 15s"}
+        
+        # 3. Get page target
+        tabs = http_requests.get(f"{cdp_base}/json", timeout=5).json()
+        page_tabs = [t for t in tabs if t.get("type") == "page"]
+        
+        if not page_tabs:
+            http_requests.put(f"{cdp_base}/json/new?about:blank", timeout=5)
+            tabs = http_requests.get(f"{cdp_base}/json", timeout=5).json()
+            page_tabs = [t for t in tabs if t.get("type") == "page"]
+        
+        if not page_tabs:
+            return {"success": False, "error": "No page target available"}
+        
+        ws_url = page_tabs[0]["webSocketDebuggerUrl"]
+        
+        # 4. Connect via WebSocket and navigate
+        ws = websocket.create_connection(ws_url, timeout=60)
+        msg_id = 1
+        
+        def send_cdp(method, params=None):
+            nonlocal msg_id
+            msg = {"id": msg_id, "method": method, "params": params or {}}
+            ws.send(json.dumps(msg))
+            msg_id += 1
+            while True:
+                resp = json.loads(ws.recv())
+                if resp.get("id") == msg_id - 1:
+                    return resp
+        
+        # Set viewport
+        send_cdp("Emulation.setDeviceMetricsOverride", {
+            "width": width, "height": height,
+            "deviceScaleFactor": 1, "mobile": False,
+        })
+        
+        send_cdp("Page.enable")
+        send_cdp("Page.navigate", {"url": target_url})
+        
+        # Wait for page to load
+        time.sleep(wait)
+        
+        # 5. Take screenshot
+        if full_page:
+            # Get full page dimensions
+            metrics = send_cdp("Page.getLayoutMetrics")
+            content_size = metrics.get("result", {}).get("contentSize", {})
+            page_width = content_size.get("width", width)
+            page_height = content_size.get("height", height)
+            
+            # Set viewport to full page
+            send_cdp("Emulation.setDeviceMetricsOverride", {
+                "width": int(page_width), "height": int(page_height),
+                "deviceScaleFactor": 1, "mobile": False,
+            })
+            time.sleep(1)
+        
+        screenshot_result = send_cdp("Page.captureScreenshot", {
+            "format": "png",
+            "quality": 90,
+        })
+        
+        screenshot_data = screenshot_result.get("result", {}).get("data", "")
+        
+        # Get page info
+        info_result = send_cdp("Runtime.evaluate", {
+            "expression": "JSON.stringify({title: document.title, url: window.location.href})",
+            "returnByValue": True,
+        })
+        page_info_raw = info_result.get("result", {}).get("result", {}).get("value", "{}")
+        
+        ws.close()
+        
+        try:
+            page_info = json.loads(page_info_raw)
+        except Exception:
+            page_info = {}
+        
+        return {
+            "success": True,
+            "data": {
+                "screenshot_base64": screenshot_data,
+                "page_title": page_info.get("title", ""),
+                "page_url": page_info.get("url", target_url),
+                "width": width,
+                "height": page_height if full_page else height,
+                "full_page": full_page,
+            }
+        }
+    
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+    finally:
+        if chrome_proc and chrome_proc.poll() is None:
+            try:
+                chrome_proc.terminate()
+                chrome_proc.wait(timeout=5)
+            except Exception:
+                chrome_proc.kill()
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # Flask API
 # --------------------------------------------------------------------------- #
 
@@ -316,6 +476,55 @@ def scrape():
         else:
             _stats["errors"] += 1
         
+        return jsonify(result)
+    except Exception as e:
+        _stats["errors"] += 1
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        _stats["active"] -= 1
+
+
+@app.route("/url-scraper-service/api/v1/screenshot/", methods=["POST"])
+def screenshot():
+    """Take a screenshot of a URL. Returns base64 PNG or binary PNG file."""
+    _stats["active"] += 1
+    try:
+        body = flask_request.get_json(force=True)
+        target_url = body.get("target_url", "")
+        full_page = body.get("full_page", True)
+        width = body.get("width", 1920)
+        height = body.get("height", 1080)
+        wait = body.get("wait", 5)
+        output = body.get("output", "base64")  # "base64" or "binary"
+
+        if not target_url:
+            return jsonify({"success": False, "error": "target_url required"}), 400
+
+        future = executor.submit(screenshot_url, target_url, full_page, width, height, wait)
+        result = future.result(timeout=SCRAPE_TIMEOUT + 30)
+
+        if not result.get("success"):
+            _stats["errors"] += 1
+            return jsonify(result), 500
+
+        _stats["processed"] += 1
+
+        # Return as binary PNG file
+        if output == "binary":
+            import base64
+            from flask import Response
+            png_data = base64.b64decode(result["data"]["screenshot_base64"])
+            return Response(
+                png_data,
+                mimetype="image/png",
+                headers={
+                    "Content-Disposition": f"inline; filename=screenshot.png",
+                    "X-Page-Title": result["data"].get("page_title", ""),
+                    "X-Page-URL": result["data"].get("page_url", ""),
+                }
+            )
+
+        # Return as JSON with base64
         return jsonify(result)
     except Exception as e:
         _stats["errors"] += 1
