@@ -415,9 +415,23 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
         
         screenshot_data = screenshot_result.get("result", {}).get("data", "")
         
-        # Get page info
+        # Get page info + text content
         info_result = send_cdp("Runtime.evaluate", {
-            "expression": "JSON.stringify({title: document.title, url: window.location.href})",
+            "expression": """JSON.stringify({
+                title: document.title,
+                url: window.location.href,
+                text_content: document.body.innerText,
+                meta_description: (document.querySelector('meta[name="description"]') || {}).content || '',
+                meta_keywords: (document.querySelector('meta[name="keywords"]') || {}).content || '',
+                og_title: (document.querySelector('meta[property="og:title"]') || {}).content || '',
+                og_description: (document.querySelector('meta[property="og:description"]') || {}).content || '',
+                og_image: (document.querySelector('meta[property="og:image"]') || {}).content || '',
+                h1: Array.from(document.querySelectorAll('h1')).map(e => e.innerText).join(' | '),
+                h2s: Array.from(document.querySelectorAll('h2')).map(e => e.innerText),
+                links_count: document.querySelectorAll('a[href]').length,
+                images_count: document.querySelectorAll('img').length,
+                word_count: document.body.innerText.split(/\\s+/).filter(w => w.length > 0).length
+            })""",
             "returnByValue": True,
         })
         page_info_raw = info_result.get("result", {}).get("result", {}).get("value", "{}")
@@ -435,6 +449,21 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
                 "screenshot_base64": screenshot_data,
                 "page_title": page_info.get("title", ""),
                 "page_url": page_info.get("url", target_url),
+                "text_content": page_info.get("text_content", ""),
+                "meta": {
+                    "description": page_info.get("meta_description", ""),
+                    "keywords": page_info.get("meta_keywords", ""),
+                    "og_title": page_info.get("og_title", ""),
+                    "og_description": page_info.get("og_description", ""),
+                    "og_image": page_info.get("og_image", ""),
+                },
+                "structure": {
+                    "h1": page_info.get("h1", ""),
+                    "h2s": page_info.get("h2s", []),
+                    "links_count": page_info.get("links_count", 0),
+                    "images_count": page_info.get("images_count", 0),
+                    "word_count": page_info.get("word_count", 0),
+                },
                 "width": width,
                 "height": page_height if full_page else height,
                 "full_page": full_page,
