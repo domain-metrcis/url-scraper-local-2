@@ -367,6 +367,7 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
         ws_url = page_tabs[0]["webSocketDebuggerUrl"]
         
         # 4. Connect via WebSocket and navigate
+        import websocket
         ws = websocket.create_connection(ws_url, timeout=60)
         msg_id = 1
         
