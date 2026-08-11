@@ -83,11 +83,17 @@ DEFAULT_SELECTORS = [
 # Build extraction JS from selectors
 # --------------------------------------------------------------------------- #
 
-def build_extraction_js(selectors: list) -> str:
+def build_extraction_js(selectors: list, remove_tags: list = None) -> str:
     """Build JavaScript that extracts data using the provided selectors."""
     selectors_json = json.dumps(selectors)
+    # ponytail: remove_tags strips entire HTML elements globally before extraction
+    remove_tags_js = ""
+    if remove_tags:
+        tag_selector = ", ".join(remove_tags)
+        remove_tags_js = f"document.querySelectorAll('{tag_selector}').forEach(el => el.remove());"
     return f"""
     (() => {{
+        {remove_tags_js}
         const selectors = {selectors_json};
         const results = [];
         for (const sel of selectors) {{
@@ -124,7 +130,7 @@ def build_extraction_js(selectors: list) -> str:
 # Core: scrape with fresh chrome via CDP
 # --------------------------------------------------------------------------- #
 
-def scrape_url(target_url: str, selectors: list) -> dict:
+def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> dict:
     """Launch chrome, navigate, extract, kill. Returns parsed result."""
     
     if not selectors:
@@ -224,7 +230,7 @@ def scrape_url(target_url: str, selectors: list) -> dict:
         time.sleep(8)
         
         # 5. Extract data using JS
-        extraction_js = build_extraction_js(selectors)
+        extraction_js = build_extraction_js(selectors, remove_tags)
         result = send_cdp("Runtime.evaluate", {
             "expression": extraction_js,
             "returnByValue": True,
@@ -494,11 +500,12 @@ def scrape():
         body = flask_request.get_json(force=True)
         target_url = body.get("target_url", "")
         selectors = body.get("selectors", [])
+        remove_tags = body.get("remove_tags", ["figcaption"])
         
         if not target_url:
             return jsonify({"success": False, "error": "target_url required"}), 400
         
-        future = executor.submit(scrape_url, target_url, selectors)
+        future = executor.submit(scrape_url, target_url, selectors, remove_tags)
         result = future.result(timeout=SCRAPE_TIMEOUT + 30)
         
         if result.get("success"):
