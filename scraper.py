@@ -1,20 +1,21 @@
 """
-Minimal URL Scraper — Fresh Chrome per request via CDP.
+URL Scraper — PULL-based worker (fresh Chrome per job via CDP).
 
 Files:
-  - scraper.py (this file) — Flask API + Chrome lifecycle
+  - scraper.py (this file) — queue poller + Chrome lifecycle
   - url-scraper.json — Workflow schema (reference only, JS is embedded here)
 
-Each request:
-  1. Launch fresh ungoogled-chromium with cf-autoclick extension
-  2. Connect via CDP (Chrome DevTools Protocol)  
-  3. Navigate to URL, wait for page load
-  4. Execute JS to extract data using selectors
-  5. Kill chrome, delete profile
-  
-API:
-  POST /url-scraper-service/api/v1/scrape/
-  GET  /url-scraper-service/api/v1/health/
+Model (matches ahref-local/ahrefs_checker.py):
+  The worker POLLS the management service for a domain to scrape and POSTs the
+  result back. No Flask server, no public tunnel, no self-registration.
+
+  Loop (per worker thread):
+    1. GET  {api-url}/url-scraper/         -> execution_record  (or 204 = idle)
+    2. Launch fresh ungoogled-chromium (+ cf-autoclick), navigate, extract via CDP
+    3. POST {api-url}/url-scraper/ {execution_record, result}
+    4. Kill chrome, delete profile; repeat
+
+API base (default): the domain-metrics management service behind b-domain.
 """
 
 import argparse
@@ -24,14 +25,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import socket
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests as http_requests
-from flask import Flask, jsonify, request as flask_request
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -43,14 +44,20 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 CHROME_BIN = os.getenv("CHROME_BIN", str(SCRIPT_DIR / "vendor" / "ungoogled-chromium" / "chrome"))
 CF_AUTOCLICK_DIR = os.getenv("CF_AUTOCLICK_DIR", str(SCRIPT_DIR / "vendor" / "cf-autoclick"))
 DISPLAY = os.getenv("DISPLAY", ":0")
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))
 SCRAPE_TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "60"))
-PORT = int(os.getenv("SCRAPER_PORT", "8814"))
 
-app = Flask(__name__)
-executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+# Pull-based config
+DEFAULT_API_URL = os.getenv(
+    "SCRAPER_API_URL",
+    "https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1",
+)
+# Endpoint path (GET to pop a job, POST to submit the result).
+SCRAPER_ENDPOINT = "/url-scraper/"
+# Seconds to sleep when the queue is empty (204) before polling again.
+IDLE_POLL_INTERVAL = int(os.getenv("SCRAPER_IDLE_POLL_INTERVAL", "5"))
 
 _stats = {"processed": 0, "errors": 0, "active": 0, "started_at": time.time()}
+_stats_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -490,102 +497,133 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
 
 
 # --------------------------------------------------------------------------- #
-# Flask API
+# Pull-based worker: poll the management queue, scrape, post the result back
 # --------------------------------------------------------------------------- #
 
-@app.route("/url-scraper-service/api/v1/scrape/", methods=["POST"])
-def scrape():
-    _stats["active"] += 1
+def _extract_target_url(record: Dict[str, Any]) -> Optional[str]:
+    """Derive the URL to scrape from an execution record.
+
+    Prefers an explicit target_url; falls back to source_url/url, or builds
+    https://<domain_name> from the domain.
+    """
+    for key in ("target_url", "source_url", "url"):
+        val = record.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    domain = record.get("domain_name")
+    if isinstance(domain, str) and domain.strip():
+        d = domain.strip()
+        return d if d.startswith(("http://", "https://")) else f"https://{d}"
+    return None
+
+
+def _result_payload(record: Dict[str, Any], scrape_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Map an internal scrape_url() result to the management POST contract.
+
+    Success -> {status: completed, success: True, content, extracted}.
+    Failure -> {status: error, success: False, error}.
+    """
+    domain = record.get("domain_name", "")
+    if not scrape_result.get("success"):
+        return {
+            "domain_name": domain,
+            "status": "error",
+            "success": False,
+            "error": scrape_result.get("error", "scrape failed"),
+        }
+
+    data = scrape_result.get("data", {}) or {}
+    variables = data.get("variables", {}) or {}
+    # Prefer the main article/body content; fall back to full page text/html.
+    content = (
+        variables.get("source_content")
+        or variables.get("page_html")
+        or ""
+    )
+    return {
+        "domain_name": domain,
+        "status": "completed",
+        "success": True,
+        "content": content,
+        "extracted": variables,
+    }
+
+
+def _process_one(session: http_requests.Session, api_base: str) -> bool:
+    """Pop one job, scrape it, POST the result. Returns True if a job was
+    processed, False if the queue was empty (204)."""
+    get_url = f"{api_base}{SCRAPER_ENDPOINT}"
     try:
-        body = flask_request.get_json(force=True)
-        target_url = body.get("target_url", "")
-        selectors = body.get("selectors", [])
-        remove_tags = body.get("remove_tags", ["figcaption"])
-        
+        resp = session.get(get_url, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        print(f"  ⚠️ GET failed: {e}")
+        time.sleep(IDLE_POLL_INTERVAL)
+        return False
+
+    if resp.status_code == 204:
+        return False
+    if resp.status_code != 200:
+        print(f"  ⚠️ GET HTTP {resp.status_code}: {resp.text[:200]}")
+        time.sleep(IDLE_POLL_INTERVAL)
+        return False
+
+    try:
+        body = resp.json()
+        record = body.get("data") or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"  ⚠️ GET bad JSON: {e}")
+        return False
+
+    if not record:
+        return False
+
+    target_url = _extract_target_url(record)
+    with _stats_lock:
+        _stats["active"] += 1
+    try:
         if not target_url:
-            return jsonify({"success": False, "error": "target_url required"}), 400
-        
-        future = executor.submit(scrape_url, target_url, selectors, remove_tags)
-        result = future.result(timeout=SCRAPE_TIMEOUT + 30)
-        
-        if result.get("success"):
+            scrape_result = {"success": False, "error": "no target_url/domain_name in record"}
+        else:
+            print(f"  → scraping {target_url}")
+            scrape_result = scrape_url(target_url, record.get("selectors") or [])
+    except Exception as e:  # noqa: BLE001
+        scrape_result = {"success": False, "error": f"scrape exception: {e}"}
+    finally:
+        with _stats_lock:
+            _stats["active"] -= 1
+
+    payload = {"execution_record": record, "result": _result_payload(record, scrape_result)}
+    try:
+        post_resp = session.post(get_url, json=payload, timeout=30)
+        ok = post_resp.status_code == 200
+    except Exception as e:  # noqa: BLE001
+        print(f"  ⚠️ POST failed: {e}")
+        ok = False
+
+    with _stats_lock:
+        if scrape_result.get("success") and ok:
             _stats["processed"] += 1
         else:
             _stats["errors"] += 1
-        
-        return jsonify(result)
-    except Exception as e:
-        _stats["errors"] += 1
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        _stats["active"] -= 1
+    status = "ok" if scrape_result.get("success") else "FAILED"
+    print(f"  ✓ {record.get('domain_name','?')} scrape={status} post={'ok' if ok else 'fail'}")
+    return True
 
 
-@app.route("/url-scraper-service/api/v1/screenshot/", methods=["POST"])
-def screenshot():
-    """Take a screenshot of a URL. Returns base64 PNG or binary PNG file."""
-    _stats["active"] += 1
-    try:
-        body = flask_request.get_json(force=True)
-        target_url = body.get("target_url", "")
-        full_page = body.get("full_page", True)
-        width = body.get("width", 1920)
-        height = body.get("height", 1080)
-        wait = body.get("wait", 5)
-        output = body.get("output", "base64")  # "base64" or "binary"
-
-        if not target_url:
-            return jsonify({"success": False, "error": "target_url required"}), 400
-
-        future = executor.submit(screenshot_url, target_url, full_page, width, height, wait)
-        result = future.result(timeout=SCRAPE_TIMEOUT + 30)
-
-        if not result.get("success"):
-            _stats["errors"] += 1
-            return jsonify(result), 500
-
-        _stats["processed"] += 1
-
-        # Return as binary PNG file
-        if output == "binary":
-            import base64
-            from flask import Response
-            png_data = base64.b64decode(result["data"]["screenshot_base64"])
-            return Response(
-                png_data,
-                mimetype="image/png",
-                headers={
-                    "Content-Disposition": f"inline; filename=screenshot.png",
-                    "X-Page-Title": result["data"].get("page_title", ""),
-                    "X-Page-URL": result["data"].get("page_url", ""),
-                }
-            )
-
-        # Return as JSON with base64
-        return jsonify(result)
-    except Exception as e:
-        _stats["errors"] += 1
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        _stats["active"] -= 1
-
-
-@app.route("/url-scraper-service/api/v1/health/", methods=["GET"])
-def health():
-    return jsonify({
-        "service": "url-scraper",
-        "status": "healthy",
-        "architecture": "fresh-chrome-cdp-per-request",
-        "stats": {
-            "processed": _stats["processed"],
-            "errors": _stats["errors"],
-            "active": _stats["active"],
-            "max_concurrent": MAX_CONCURRENT,
-            "uptime": int(time.time() - _stats["started_at"]),
-        },
-        "chrome": CHROME_BIN,
-        "extension": CF_AUTOCLICK_DIR,
-    })
+def _worker_loop(worker_id: int, api_base: str) -> None:
+    """One worker thread: continuously pop + scrape + submit."""
+    session = http_requests.Session()
+    print(f"[worker {worker_id}] polling {api_base}{SCRAPER_ENDPOINT}")
+    while True:
+        try:
+            processed = _process_one(session, api_base)
+            if not processed:
+                time.sleep(IDLE_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"[worker {worker_id}] loop error: {e}")
+            time.sleep(IDLE_POLL_INTERVAL)
 
 
 # --------------------------------------------------------------------------- #
@@ -593,24 +631,35 @@ def health():
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("--max-concurrent", type=int, default=MAX_CONCURRENT)
+    parser = argparse.ArgumentParser(description="URL Scraper pull-based worker")
+    parser.add_argument(
+        "--api-url", type=str, default=DEFAULT_API_URL,
+        help="Management API base (…/api/v1). Worker polls {base}/url-scraper/.",
+    )
+    parser.add_argument("--workers", type=int, default=1, help="Parallel scraper workers")
     parser.add_argument("--timeout", type=int, default=SCRAPE_TIMEOUT)
     parser.add_argument("--chrome", type=str, default=CHROME_BIN)
     parser.add_argument("--extension", type=str, default=CF_AUTOCLICK_DIR)
     args = parser.parse_args()
-    
+
     CHROME_BIN = args.chrome
     CF_AUTOCLICK_DIR = args.extension
-    MAX_CONCURRENT = args.max_concurrent
     SCRAPE_TIMEOUT = args.timeout
-    executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
-    
-    print(f"🚀 URL Scraper starting on port {args.port}")
-    print(f"   Chrome: {CHROME_BIN}")
+    api_base = args.api_url.rstrip("/")
+
+    print("🚀 URL Scraper (pull-based) starting")
+    print(f"   API:       {api_base}{SCRAPER_ENDPOINT}")
+    print(f"   Workers:   {args.workers}")
+    print(f"   Chrome:    {CHROME_BIN}")
     print(f"   Extension: {CF_AUTOCLICK_DIR}")
-    print(f"   Concurrent: {MAX_CONCURRENT}")
-    print(f"   Timeout: {SCRAPE_TIMEOUT}s")
-    
-    app.run(host="0.0.0.0", port=args.port, threaded=True)
+    print(f"   Timeout:   {SCRAPE_TIMEOUT}s")
+
+    if args.workers <= 1:
+        _worker_loop(0, api_base)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for wid in range(args.workers):
+                pool.submit(_worker_loop, wid, api_base)
+            # Block forever (workers loop internally).
+            while True:
+                time.sleep(3600)
