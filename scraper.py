@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import socket
+from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -55,6 +56,7 @@ DEFAULT_API_URL = os.getenv(
 SCRAPER_ENDPOINT = "/url-scraper/"
 # Seconds to sleep when the queue is empty (204) before polling again.
 IDLE_POLL_INTERVAL = int(os.getenv("SCRAPER_IDLE_POLL_INTERVAL", "5"))
+WAIT_FOR_TIMEOUT = int(os.getenv("SCRAPER_WAIT_FOR_TIMEOUT", "30"))
 
 _stats = {"processed": 0, "errors": 0, "active": 0, "started_at": time.time()}
 _stats_lock = threading.Lock()
@@ -137,8 +139,15 @@ def build_extraction_js(selectors: list, remove_tags: list = None) -> str:
 # Core: scrape with fresh chrome via CDP
 # --------------------------------------------------------------------------- #
 
-def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> dict:
-    """Launch chrome, navigate, extract, kill. Returns parsed result."""
+def scrape_url(target_url: str, selectors: list, remove_tags: list = None,
+               wait_for: str = None) -> dict:
+    """Launch chrome, navigate, extract, kill. Returns parsed result.
+
+    wait_for: optional CSS selector to poll for before extracting. Client-side
+    frameworks (Angular, React) render after load, so a fixed sleep either
+    wastes time or extracts an empty DOM. When given, we poll until the element
+    appears (up to WAIT_FOR_TIMEOUT) instead of sleeping blind.
+    """
     
     if not selectors:
         selectors = DEFAULT_SELECTORS
@@ -233,8 +242,27 @@ def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> di
         # Navigate
         send_cdp("Page.navigate", {"url": target_url})
         
-        # Wait for load (simple approach: just wait)
-        time.sleep(8)
+        # Wait for load. With wait_for, poll for the element instead of
+        # sleeping blind — client-rendered pages populate late.
+        if wait_for:
+            deadline = time.time() + WAIT_FOR_TIMEOUT
+            found = False
+            while time.time() < deadline:
+                probe = send_cdp("Runtime.evaluate", {
+                    "expression": f"!!document.querySelector({json.dumps(wait_for)})",
+                    "returnByValue": True,
+                })
+                if probe.get("result", {}).get("result", {}).get("value") is True:
+                    found = True
+                    break
+                time.sleep(0.5)
+            if not found:
+                print(f"  ⚠️ wait_for {wait_for!r} never appeared "
+                      f"after {WAIT_FOR_TIMEOUT}s; extracting anyway")
+            # Let the rest of the view settle once the anchor is present.
+            time.sleep(2)
+        else:
+            time.sleep(8)
         
         # 5. Extract data using JS
         extraction_js = build_extraction_js(selectors, remove_tags)
@@ -517,11 +545,16 @@ def _extract_target_url(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _result_payload(record: Dict[str, Any], scrape_result: Dict[str, Any]) -> Dict[str, Any]:
+def _result_payload(record: Dict[str, Any], scrape_result: Dict[str, Any],
+                    scraped_at: str = None) -> Dict[str, Any]:
     """Map an internal scrape_url() result to the management POST contract.
 
     Success -> {status: completed, success: True, content, extracted}.
     Failure -> {status: error, success: False, error}.
+
+    scraped_at (UTC ISO-8601) is when the extraction actually ran. The server
+    needs it to turn a RELATIVE countdown ("11h 24m") into an absolute auction
+    end time; without it, it has to fall back to POST arrival time.
     """
     domain = record.get("domain_name", "")
     if not scrape_result.get("success"):
@@ -530,6 +563,7 @@ def _result_payload(record: Dict[str, Any], scrape_result: Dict[str, Any]) -> Di
             "status": "error",
             "success": False,
             "error": scrape_result.get("error", "scrape failed"),
+            "scraped_at": scraped_at,
         }
 
     data = scrape_result.get("data", {}) or {}
@@ -546,6 +580,7 @@ def _result_payload(record: Dict[str, Any], scrape_result: Dict[str, Any]) -> Di
         "success": True,
         "content": content,
         "extracted": variables,
+        "scraped_at": scraped_at,
     }
 
 
@@ -585,14 +620,24 @@ def _process_one(session: http_requests.Session, api_base: str) -> bool:
             scrape_result = {"success": False, "error": "no target_url/domain_name in record"}
         else:
             print(f"  → scraping {target_url}")
-            scrape_result = scrape_url(target_url, record.get("selectors") or [])
+            scrape_result = scrape_url(
+                target_url,
+                record.get("selectors") or [],
+                wait_for=record.get("wait_for_selector") or None,
+            )
     except Exception as e:  # noqa: BLE001
         scrape_result = {"success": False, "error": f"scrape exception: {e}"}
     finally:
+        # Stamped as close to the extraction as possible: a relative countdown
+        # is only meaningful against the moment it was read.
+        scraped_at = datetime.now(timezone.utc).isoformat()
         with _stats_lock:
             _stats["active"] -= 1
 
-    payload = {"execution_record": record, "result": _result_payload(record, scrape_result)}
+    payload = {
+        "execution_record": record,
+        "result": _result_payload(record, scrape_result, scraped_at),
+    }
     try:
         post_resp = session.post(get_url, json=payload, timeout=30)
         ok = post_resp.status_code == 200
