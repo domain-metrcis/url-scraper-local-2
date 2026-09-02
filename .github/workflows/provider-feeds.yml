@@ -28,7 +28,9 @@ on:
 
 env:
   DISPLAY: ':99'
-  CHROMIUM_VERSION: '131.0.6778.85-1'
+  # Same build the url-scraper VNC workflow pins, so both stacks behave
+  # identically against Cloudflare.
+  CHROMIUM_VERSION: '149.0.7827.53-1'
   FEED_PROVIDER: ${{ github.event.inputs.provider || 'namejet' }}
 
 jobs:
