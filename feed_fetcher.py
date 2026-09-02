@@ -163,6 +163,15 @@ class Chrome:
         )
         return got.get("result", {}).get("result", {}).get("value")
 
+    def eval_js_slow(self, expression: str, timeout: int = 240) -> Any:
+        """eval_js with a long timeout — the feed body is multi-megabyte."""
+        got = self.call(
+            "Runtime.evaluate",
+            {"expression": expression, "returnByValue": True},
+            timeout=timeout,
+        )
+        return got.get("result", {}).get("result", {}).get("value")
+
 
 def clear_challenge(chrome: Chrome, warmup_url: str, timeout: int) -> None:
     """Navigate the origin and wait until Cloudflare stops interstitialling."""
@@ -199,23 +208,41 @@ def harvest_cookies(chrome: Chrome) -> List[Dict[str, Any]]:
     return cookies
 
 
-def download_feed(feed_url: str, cookies: List[Dict[str, Any]], user_agent: str,
-                  referer: str) -> str:
-    session = requests.Session()
-    for c in cookies:
-        try:
-            session.cookies.set(c["name"], c["value"], domain=c.get("domain"))
-        except Exception:
-            pass
-    log(f"  downloading {feed_url}")
-    resp = session.get(
-        feed_url,
-        headers={"User-Agent": user_agent, "Referer": referer},
-        timeout=180,
+def download_feed_in_browser(chrome: Chrome, feed_url: str) -> str:
+    """Fetch the feed from inside the cleared page.
+
+    A plain ``requests`` GET carrying the harvested cookies is NOT enough:
+    Cloudflare also fingerprints the TLS handshake, so a Python client presents
+    as a bot and still gets 403 even holding a valid cf_clearance. Issuing the
+    request from the browser reuses Chrome's own connection, fingerprint,
+    cookie jar and headers, so it is indistinguishable from the page's own
+    traffic.
+
+    Synchronous XHR on purpose: ``Runtime.evaluate`` is called without
+    ``awaitPromise``, so a fetch() promise would come back unresolved. The feed
+    is same-origin with the warmup page, so no CORS is involved.
+    """
+    log(f"  downloading {feed_url} from inside the browser")
+    js = (
+        "(() => { try {"
+        " var x = new XMLHttpRequest();"
+        f" x.open('GET', {json.dumps(feed_url)}, false);"
+        " x.send(null);"
+        " return JSON.stringify({status: x.status, body: x.responseText});"
+        " } catch (e) { return JSON.stringify({status: -1, error: String(e)}); } })()"
     )
-    log(f"  HTTP {resp.status_code}, {len(resp.content)} bytes")
-    resp.raise_for_status()
-    body = resp.text
+    raw = chrome.eval_js_slow(js)
+    if not raw:
+        raise RuntimeError("in-browser download returned nothing")
+    payload = json.loads(raw)
+    status = payload.get("status")
+    if status != 200:
+        raise RuntimeError(
+            f"in-browser download failed: HTTP {status} "
+            f"{payload.get('error', '')}".strip()
+        )
+    body = payload.get("body") or ""
+    log(f"  HTTP {status}, {len(body.encode('utf-8'))} bytes")
     if any(m in body[:4096].lower() for m in CHALLENGE_MARKERS):
         raise RuntimeError("feed body is a Cloudflare challenge page, not the file")
     return body
@@ -266,9 +293,10 @@ def main() -> int:
         try:
             with Chrome(args.chrome, args.extension) as chrome:
                 clear_challenge(chrome, spec["warmup_url"], args.challenge_timeout)
-                cookies = harvest_cookies(chrome)
-                ua = chrome.eval_js("navigator.userAgent") or "Mozilla/5.0"
-                body = download_feed(spec["feed_url"], cookies, ua, spec["warmup_url"])
+                # Logged for diagnosis: cf_clearance present means the
+                # challenge really cleared, which is the hard part.
+                harvest_cookies(chrome)
+                body = download_feed_in_browser(chrome, spec["feed_url"])
             out = push_feed(args.api_url, args.token, args.provider, body, spec["feed_url"])
             log(f"✅ stored: {json.dumps(out.get('data', out))}")
             return 0
